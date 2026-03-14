@@ -1,0 +1,34 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target":                   "ES2017",
+    "lib":                      ["dom", "dom.iterable", "esnext"],
+    "module":                   "esnext",
+    "moduleResolution":         "bundler",
+    "jsx":                      "preserve",
+    "incremental":              true,
+    "noUncheckedIndexedAccess": false,
+    "noImplicitAny":            false,
+    "plugins": [{ "name": "next" }],
+    "paths": {
+      "@/*":                      ["./src/*"],
+      "@draftchess/db":           ["../../packages/db/src/index.ts"],
+      "@draftchess/shared":       ["../../packages/shared/src/index.ts"],
+      "@draftchess/shared/*":     ["../../packages/shared/src/*.ts"],
+      "@draftchess/socket-types": ["../../packages/socket-types/src/index.ts"]
+    }
+  },
+  "references": [
+    { "path": "../../packages/db" },
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/socket-types" }
+  ],
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    "src/types/**/*.d.ts"
+  ],
+  "exclude": ["node_modules"]
+}

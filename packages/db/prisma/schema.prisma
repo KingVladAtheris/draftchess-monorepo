@@ -1,0 +1,384 @@
+// prisma/schema.prisma
+
+datasource db {
+  provider  = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ─── Enums ─────────────────────────────────────────────────────────────────
+
+// Game mode. Drives budget limits and ELO separation.
+//   standard: 33pt draft, 6pt prep
+//   pauper:   18pt draft, 3pt prep
+//   royal:    48pt draft, 12pt prep
+enum GameMode {
+  standard
+  pauper
+  royal
+}
+
+enum TournamentFormat {
+  single_elimination
+  swiss
+  round_robin
+  arena
+}
+
+enum TournamentStatus {
+  upcoming
+  active
+  finished
+  cancelled
+}
+
+// ─── User ──────────────────────────────────────────────────────────────────
+model User {
+  id            Int       @id @default(autoincrement())
+  username      String    @unique
+  email         String    @unique
+  passwordHash  String
+  name          String?
+  emailVerified DateTime?
+  image         String?
+  createdAt     DateTime  @default(now())
+
+  // Per-mode ELO — separate ratings and counters per mode
+  eloStandard         Int @default(1200)
+  eloPauper           Int @default(1200)
+  eloRoyal            Int @default(1200)
+
+  gamesPlayedStandard Int @default(0)
+  gamesPlayedPauper   Int @default(0)
+  gamesPlayedRoyal    Int @default(0)
+
+  winsStandard        Int @default(0)
+  winsPauper          Int @default(0)
+  winsRoyal           Int @default(0)
+
+  lossesStandard      Int @default(0)
+  lossesPauper        Int @default(0)
+  lossesRoyal         Int @default(0)
+
+  drawsStandard       Int @default(0)
+  drawsPauper         Int @default(0)
+  drawsRoyal          Int @default(0)
+
+  // Queue & game state
+  queueStatus   String?   @default("offline")
+  queuedAt      DateTime?
+  queuedDraftId Int?
+  queuedMode    GameMode? // which mode they queued for
+
+  // Relations
+  drafts            Draft[]
+  queuedDraft       Draft?             @relation("UserQueuedDraft", fields: [queuedDraftId], references: [id], onDelete: SetNull)
+  gamesAsPlayer1    Game[]             @relation("Player1")
+  gamesAsPlayer2    Game[]             @relation("Player2")
+  gamesAsWhite      Game[]             @relation("WhitePlayer")
+  tokens            UserToken[]
+  tournamentEntries TournamentPlayer[]
+  following         UserFollow[]       @relation("Follower")
+  followers         UserFollow[]       @relation("Following")
+  sentRequests      FriendRequest[]    @relation("SentRequests")
+  receivedRequests  FriendRequest[]    @relation("ReceivedRequests")
+  sentChallenges    GameChallenge[]    @relation("SentChallenges")
+  receivedChallenges GameChallenge[]   @relation("ReceivedChallenges")
+  accounts          Account[]
+  sessions          Session[]
+
+  @@index([queueStatus])
+  @@index([queuedDraftId])
+  @@index([eloStandard])
+  @@index([eloPauper])
+  @@index([eloRoyal])
+}
+
+// ─── Draft ─────────────────────────────────────────────────────────────────
+model Draft {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  name      String?
+  fen       String
+  points    Int
+  mode      GameMode @default(standard)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user          User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  queuedByUsers User[] @relation("UserQueuedDraft")
+  gamesAsDraft1 Game[] @relation("GameDraft1")
+  gamesAsDraft2 Game[] @relation("GameDraft2")
+  challenges    GameChallenge[] @relation("ChallengeSenderDraft")
+
+  @@index([userId])
+  @@index([userId, mode])
+  @@index([updatedAt])
+}
+
+// ─── Game ──────────────────────────────────────────────────────────────────
+model Game {
+  id               Int      @id @default(autoincrement())
+  player1Id        Int
+  player2Id        Int
+  whitePlayerId    Int
+  mode             GameMode @default(standard)
+  status           String   @default("waiting")
+  draft1Id         Int?
+  draft2Id         Int?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  fen              String?
+  prepStartedAt    DateTime?
+  readyPlayer1     Boolean  @default(false)
+  readyPlayer2     Boolean  @default(false)
+  auxPointsPlayer1 Int      @default(6)
+  auxPointsPlayer2 Int      @default(6)
+
+  // Time control
+  lastMoveAt      DateTime?
+  lastMoveBy      Int?
+  moveNumber      Int       @default(0)
+  player1Timebank Int       @default(60000)
+  player2Timebank Int       @default(60000)
+
+  // Result & ELO
+  winnerId         Int?
+  player1EloBefore Int?
+  player2EloBefore Int?
+  player1EloAfter  Int?
+  player2EloAfter  Int?
+  eloChange        Int?
+  endReason        String?
+  isFriendGame     Boolean  @default(false)
+
+  // PGN stored on finish for the replayer
+  pgn              String?  @db.Text
+
+  // Rematch — set when a player requests a rematch after the game ends.
+  // Cleared when rematch is accepted (new game created) or declined.
+  rematchRequestedBy Int?
+
+  // Tournament context — null for casual games
+  tournamentId    Int?
+  tournamentRound Int?
+
+  // Relations
+  player1     User        @relation("Player1",     fields: [player1Id],     references: [id], onDelete: Cascade)
+  player2     User        @relation("Player2",     fields: [player2Id],     references: [id], onDelete: Cascade)
+  whitePlayer User        @relation("WhitePlayer", fields: [whitePlayerId], references: [id], onDelete: Cascade)
+  draft1      Draft?      @relation("GameDraft1",  fields: [draft1Id],      references: [id], onDelete: SetNull)
+  draft2      Draft?      @relation("GameDraft2",  fields: [draft2Id],      references: [id], onDelete: SetNull)
+  tournament  Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+
+  @@index([player1Id])
+  @@index([player2Id])
+  @@index([whitePlayerId])
+  @@index([status])
+  @@index([mode])
+  @@index([createdAt])
+  @@index([draft1Id])
+  @@index([draft2Id])
+  @@index([winnerId])
+  @@index([lastMoveAt])
+  @@index([tournamentId])
+  @@index([status, lastMoveAt])
+  @@index([player1Id, mode, createdAt])
+  @@index([player2Id, mode, createdAt])
+}
+
+// ─── Tokens ────────────────────────────────────────────────────────────────
+// TokenDefinition is the catalogue of token types.
+// UserToken is the join table of which users hold which tokens.
+//
+// Examples:
+//   slug: "founder"  label: "Founder"        icon: "🏅"
+//   slug: "premium"  label: "Premium"         icon: "⭐"
+//   slug: "beta"     label: "Beta Tester"     icon: "🧪"
+//   slug: "champion" label: "Tournament Champion" icon: "🏆"
+
+model TokenDefinition {
+  id          Int       @id @default(autoincrement())
+  slug        String    @unique
+  label       String
+  description String?
+  icon        String?
+  color       String?
+  // adminOnly: if true only admins can assign it.
+  // if false it can be auto-granted by gameplay logic.
+  adminOnly   Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+
+  holders     UserToken[]
+
+  @@index([slug])
+}
+
+model UserToken {
+  id        Int             @id @default(autoincrement())
+  userId    Int
+  tokenId   Int
+  grantedAt DateTime        @default(now())
+  grantedBy Int?            // userId of admin who granted, null if auto-granted
+  expiresAt DateTime?       // null = permanent
+  note      String?
+
+  user  User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token TokenDefinition @relation(fields: [tokenId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tokenId])
+  @@index([userId])
+  @@index([tokenId])
+  @@index([expiresAt])
+}
+
+// ─── Tournament ────────────────────────────────────────────────────────────
+model Tournament {
+  id                 Int              @id @default(autoincrement())
+  name               String
+  description        String?          @db.Text
+  mode               GameMode         @default(standard)
+  format             TournamentFormat @default(single_elimination)
+  status             TournamentStatus @default(upcoming)
+  registrationEndsAt DateTime?
+  startsAt           DateTime?
+  finishedAt         DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  maxPlayers         Int?
+  minPlayers         Int              @default(2)
+  prizeDescription   String?
+  winnerId           Int?
+
+  players TournamentPlayer[]
+  games   Game[]
+
+  @@index([status])
+  @@index([mode])
+  @@index([startsAt])
+}
+
+model TournamentPlayer {
+  id           Int      @id @default(autoincrement())
+  tournamentId Int
+  userId       Int
+  registeredAt DateTime @default(now())
+  score        Float    @default(0)
+  rank         Int?
+  eliminated   Boolean  @default(false)
+
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([tournamentId, userId])
+  @@index([tournamentId])
+  @@index([userId])
+  @@index([tournamentId, score])
+}
+
+// ─── Auth (unchanged) ──────────────────────────────────────────────────────
+model Account {
+  id                String  @id @default(cuid())
+  userId            Int
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       Int
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─── Friends / Follow ──────────────────────────────────────────────────────
+// UserFollow: unilateral follow (like Twitter).
+// FriendRequest: mutual friendship requiring acceptance.
+// A friendship = FriendRequest with status "accepted" in either direction.
+// Online presence is tracked in Redis (TTL per userId), not in the DB.
+// Challenge requests are sent via socket events, not stored in DB.
+
+model UserFollow {
+  id          Int      @id @default(autoincrement())
+  followerId  Int
+  followingId Int
+  createdAt   DateTime @default(now())
+
+  follower  User @relation("Follower",  fields: [followerId],  references: [id], onDelete: Cascade)
+  following User @relation("Following", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@unique([followerId, followingId])
+  @@index([followerId])
+  @@index([followingId])
+}
+
+// FriendRequest status values: "pending" | "accepted" | "declined"
+model FriendRequest {
+  id         Int      @id @default(autoincrement())
+  senderId   Int
+  receiverId Int
+  status     String   @default("pending")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  sender   User @relation("SentRequests",     fields: [senderId],   references: [id], onDelete: Cascade)
+  receiver User @relation("ReceivedRequests", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  // Only one active request between any two users at a time
+  @@unique([senderId, receiverId])
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([receiverId, status]) // fetch pending incoming requests efficiently
+}
+
+// ─── Friend Challenges ─────────────────────────────────────────────────────
+// A challenge is a direct game invitation between friends.
+// The resulting game has isFriendGame=true — no ELO is applied.
+// Status flow: pending → accepted | declined | cancelled | expired
+model GameChallenge {
+  id            Int      @id @default(autoincrement())
+  senderId      Int
+  receiverId    Int
+  mode          GameMode @default(standard)
+  senderDraftId Int?
+  status        String   @default("pending") // pending | accepted | declined | cancelled | expired
+  createdAt     DateTime @default(now())
+  expiresAt     DateTime
+
+  sender      User   @relation("SentChallenges",       fields: [senderId],      references: [id], onDelete: Cascade)
+  receiver    User   @relation("ReceivedChallenges",   fields: [receiverId],    references: [id], onDelete: Cascade)
+  senderDraft Draft? @relation("ChallengeSenderDraft", fields: [senderDraftId], references: [id], onDelete: SetNull)
+
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([receiverId, status])
+  @@index([expiresAt])
+}

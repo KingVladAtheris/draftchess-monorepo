@@ -1,0 +1,43 @@
+{
+  "name": "@draftchess/web",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint",
+    "clean": "rm -rf .next"
+  },
+  "dependencies": {
+    "@draftchess/db": "workspace:*",
+    "@draftchess/shared": "workspace:*",
+    "@draftchess/socket-types": "workspace:*",
+    "bcrypt": "^5.1.0",
+    "bullmq": "^5.0.0",
+    "chess.js": "^1.4.0",
+    "ioredis": "^5.0.0",
+    "next": "^16.1.0",
+    "next-auth": "5.0.0-beta.29",
+    "pino": "^9.0.0",
+    "rate-limiter-flexible": "^5.0.0",
+    "react": "^19.0.0",
+    "react-chessboard": "^5.10.0",
+    "react-dom": "^19.0.0",
+    "redis": "^4.6.0",
+    "socket.io-client": "^4.8.3",
+    "tailwindcss": "^4.2.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/bcrypt": "^5.0.0",
+    "@types/node": "^20.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^16.1.0",
+    "pino-pretty": "^13.0.0",
+    "typescript": "^5.4.0"
+  }
+}

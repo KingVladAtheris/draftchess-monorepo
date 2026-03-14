@@ -1,0 +1,22 @@
+{
+  "name": "@draftchess/shared",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".":            { "types": "./dist/index.d.ts",      "default": "./dist/index.js"      },
+    "./game-modes": { "types": "./dist/game-modes.d.ts", "default": "./dist/game-modes.js" },
+    "./fen-utils":  { "types": "./dist/fen-utils.d.ts",  "default": "./dist/fen-utils.js"  },
+    "./elo":        { "types": "./dist/elo.d.ts",        "default": "./dist/elo.js"         }
+  },
+  "main":  "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev":   "tsc --watch",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

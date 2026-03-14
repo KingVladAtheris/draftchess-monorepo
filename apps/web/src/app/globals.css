@@ -1,0 +1,247 @@
+/* src/app/globals.css */
+/* Design tokens + base styles for Draft Chess */
+
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Geist:wght@300;400;500;600&display=swap');
+@import 'tailwindcss';
+
+/* ─── Design tokens ─────────────────────────────────────────────────────── */
+:root {
+  /* Backgrounds */
+  --bg-base:    #0f1117;   /* page background */
+  --bg-surface: #1a1d2e;   /* cards, panels, dropdowns */
+  --bg-raised:  #222640;   /* elevated elements, hover states */
+
+  /* Brand */
+  --gold:       #f0a500;
+  --gold-light: #f5bc3a;
+  --gold-dim:   rgba(240, 165, 0, 0.15);
+
+  /* Text */
+  --text-primary:   rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.55);
+  --text-muted:     rgba(255, 255, 255, 0.30);
+
+  /* Borders */
+  --border:       rgba(255, 255, 255, 0.08);
+  --border-light: rgba(255, 255, 255, 0.05);
+
+  /* Status */
+  --success: #2dd4bf;
+  --danger:  #ef4444;
+  --warning: #f59e0b;
+
+  /* Fonts */
+  --font-display: 'Outfit', sans-serif;
+  --font-body:    'Geist', sans-serif;
+
+  /* Radii */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+}
+
+/* ─── Base ──────────────────────────────────────────────────────────────── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* ─── Scrollbar ─────────────────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+/* ─── Typography ────────────────────────────────────────────────────────── */
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--text-primary);
+}
+
+/* ─── Focus ring ────────────────────────────────────────────────────────── */
+:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* ─── Selection ─────────────────────────────────────────────────────────── */
+::selection {
+  background: rgba(240, 165, 0, 0.25);
+  color: #fff;
+}
+
+/* ─── Utility classes ───────────────────────────────────────────────────── */
+@layer components {
+
+  /* Surfaces */
+  .surface {
+    background-color: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+  }
+
+  .surface-raised {
+    background-color: var(--bg-raised);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+  }
+
+  /* Buttons */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 24px;
+    font-family: var(--font-display);
+    font-size: 14px;
+    font-weight: 600;
+    color: #0f1117;
+    background-color: var(--gold);
+    border: none;
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background-color 150ms, transform 100ms;
+    white-space: nowrap;
+  }
+  .btn-primary:hover  { background-color: var(--gold-light); }
+  .btn-primary:active { transform: scale(0.98); }
+  .btn-primary:disabled {
+    background-color: rgba(240, 165, 0, 0.25);
+    color: rgba(255,255,255,0.3);
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 24px;
+    font-family: var(--font-display);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--gold);
+    background-color: transparent;
+    border: 1px solid rgba(240, 165, 0, 0.35);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background-color 150ms, border-color 150ms, transform 100ms;
+    white-space: nowrap;
+  }
+  .btn-secondary:hover {
+    background-color: var(--gold-dim);
+    border-color: rgba(240, 165, 0, 0.6);
+  }
+  .btn-secondary:active { transform: scale(0.98); }
+  .btn-secondary:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .btn-ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 24px;
+    font-family: var(--font-display);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    background-color: transparent;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background-color 150ms, color 150ms, transform 100ms;
+    white-space: nowrap;
+  }
+  .btn-ghost:hover {
+    background-color: rgba(255, 255, 255, 0.06);
+    color: var(--text-primary);
+  }
+  .btn-ghost:active { transform: scale(0.98); }
+
+  .btn-danger {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 24px;
+    font-family: var(--font-display);
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--danger);
+    background-color: transparent;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: var(--radius-md);
+    cursor: pointer;
+    transition: background-color 150ms, border-color 150ms, transform 100ms;
+    white-space: nowrap;
+  }
+  .btn-danger:hover {
+    background-color: rgba(239, 68, 68, 0.1);
+    border-color: rgba(239, 68, 68, 0.5);
+  }
+  .btn-danger:active { transform: scale(0.98); }
+
+  /* Form inputs */
+  .input {
+    width: 100%;
+    padding: 10px 14px;
+    font-family: var(--font-body);
+    font-size: 14px;
+    color: var(--text-primary);
+    background-color: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    outline: none;
+    transition: border-color 150ms, background-color 150ms;
+  }
+  .input::placeholder { color: var(--text-muted); }
+  .input:hover { border-color: rgba(255, 255, 255, 0.15); }
+  .input:focus {
+    border-color: rgba(240, 165, 0, 0.5);
+    background-color: rgba(255, 255, 255, 0.06);
+  }
+
+  /* Text helpers */
+  .text-gold   { color: var(--gold); }
+  .text-muted  { color: var(--text-muted); }
+  .text-subtle { color: var(--text-secondary); }
+
+  /* Page wrapper */
+  .page {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 32px 16px;
+  }
+}
