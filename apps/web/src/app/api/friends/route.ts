@@ -1,4 +1,4 @@
-// src/app/api/friends/route.ts
+// apps/web/src/app/api/friends/route.ts
 // GET — returns current user's friends (accepted requests) and
 //        pending incoming requests, with online status from Redis.
 

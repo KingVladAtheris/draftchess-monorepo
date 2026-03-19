@@ -1,4 +1,4 @@
-// src/app/api/friends/request/route.ts
+// apps/web/src/app/api/friends/request/route.ts
 // POST — send a friend request to a user by userId.
 
 import { NextRequest, NextResponse } from "next/server";

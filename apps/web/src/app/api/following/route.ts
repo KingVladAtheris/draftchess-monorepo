@@ -1,4 +1,4 @@
-// src/app/api/following/route.ts
+// apps/web/src/app/api/following/route.ts
 // GET — returns users the current user is following, with online status.
 
 import { NextRequest, NextResponse } from "next/server";

@@ -1,24 +1,24 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir":      "./dist",
-    "rootDir":     "./src",
-    "composite":   true,
-    // Point at the workspace packages' source via references.
-    // This means TypeScript reads their .ts files directly rather than
-    // needing their dist/ to exist first. Fixes the "cannot find module"
-    // error when packages haven't been built yet.
+    "outDir":    "./dist",
+    "rootDir":   "./src",
+    "composite": true,
     "paths": {
-      "@draftchess/db":           ["../../packages/db/src/index.ts"],
-      "@draftchess/shared":       ["../../packages/shared/src/index.ts"],
-      "@draftchess/shared/*":     ["../../packages/shared/src/*.ts"],
-      "@draftchess/socket-types": ["../../packages/socket-types/src/index.ts"]
+      "@draftchess/db":            ["../../packages/db/src/index.ts"],
+      "@draftchess/shared":        ["../../packages/shared/src/index.ts"],
+      "@draftchess/shared/*":      ["../../packages/shared/src/*.ts"],
+      "@draftchess/socket-types":  ["../../packages/socket-types/src/index.ts"],
+      "@draftchess/logger":        ["../../packages/logger/src/index.ts"],
+      "@draftchess/game-state":    ["../../packages/game-state/src/index.ts"]
     }
   },
   "references": [
     { "path": "../../packages/db" },
     { "path": "../../packages/shared" },
-    { "path": "../../packages/socket-types" }
+    { "path": "../../packages/socket-types" },
+    { "path": "../../packages/logger" },
+    { "path": "../../packages/game-state" }
   ],
   "include": ["src"]
 }

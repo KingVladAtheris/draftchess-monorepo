@@ -1,20 +1,28 @@
 // apps/matchmaker/src/workers/reconcile.ts
+//
 // Safety net worker — runs every 5 minutes.
 // Finds active games that have been silent longer than the maximum possible
 // time (30s move limit + full 60s timebank) and force-finishes them.
 // This catches games whose timeout jobs were lost from Redis (crash, eviction).
+//
+// With Redis game state, this worker reads from Redis first (fast path)
+// and falls back to Postgres. The staleness threshold is checked against
+// lastMoveAt in the Redis hash rather than the Postgres row.
 
-import { Worker }       from 'bullmq'
-import { prisma }       from '@draftchess/db'
-import { type GameMode, GAMES_PLAYED_FIELD } from '@draftchess/shared/game-modes'
-import { finalizeGame } from '../lib/finalize.js'
-import { publishGameUpdate } from '../lib/notify.js'
-import { timeoutQueue, redisOpts } from '../queues.js'
-import type { RedisClientType } from 'redis'
+import { Worker }                    from 'bullmq'
+import { prisma }                    from '@draftchess/db'
+import { type GameMode }             from '@draftchess/shared/game-modes'
+import { getGameState, loadGameState } from '@draftchess/game-state'
+import { finalizeGame }              from '../lib/finalize.js'
+import { publishGameUpdate }         from '../lib/notify.js'
+import { timeoutQueue, redisOpts }   from '../queues.js'
+import { logger }                    from '@draftchess/logger'
+import type { RedisClientType }      from 'redis'
 
-const MOVE_TIME_MS    = 30_000
-const MAX_TIMEBANK_MS = 60_000
-// A game silent longer than this MUST have timed out
+const log = logger.child({ module: 'matchmaker:reconcile-worker' })
+
+const MOVE_TIME_MS       = 30_000
+const MAX_TIMEBANK_MS    = 60_000
 const STALE_THRESHOLD_MS = MOVE_TIME_MS + MAX_TIMEBANK_MS + 5_000
 
 export function createReconcileWorker(publisher: RedisClientType) {
@@ -23,69 +31,81 @@ export function createReconcileWorker(publisher: RedisClientType) {
     async (_job) => {
       const staleCutoff = new Date(Date.now() - STALE_THRESHOLD_MS)
 
+      // Query Postgres for active games that appear stale by lastMoveAt.
+      // We use Postgres here (not Redis) so we catch games whose Redis hash
+      // has expired but Postgres still shows them as active — exactly the
+      // scenario this worker exists to handle.
       const staleGames = await prisma.game.findMany({
         where: {
           status:     'active',
           lastMoveAt: { lt: staleCutoff },
         },
         select: {
-          id: true, fen: true, lastMoveAt: true, mode: true, isFriendGame: true,
-          player1Id: true, player2Id: true, whitePlayerId: true,
-          player1Timebank: true, player2Timebank: true,
-          player1EloBefore: true, player2EloBefore: true,
-          player1: {
-            select: {
-              gamesPlayedStandard: true,
-              gamesPlayedPauper:   true,
-              gamesPlayedRoyal:    true,
-            },
-          },
-          player2: {
-            select: {
-              gamesPlayedStandard: true,
-              gamesPlayedPauper:   true,
-              gamesPlayedRoyal:    true,
-            },
-          },
+          id:           true,
+          mode:         true,
+          isFriendGame: true,
+          player1Id:    true,
+          player2Id:    true,
         },
       })
 
       if (staleGames.length === 0) return
-      console.log(`[reconcile] found ${staleGames.length} stale active game(s)`)
+
+      log.info({ count: staleGames.length }, 'found stale active games')
 
       for (const game of staleGames) {
         try {
-          // If a timeout job exists for this game it hasn't fired yet — skip.
+          // If a timeout job exists, it hasn't fired yet — skip.
           // The job will resolve it; we only step in when the job is gone.
           const existing = await timeoutQueue.getJob(`timeout-${game.id}`)
           if (existing) {
-            console.log(`[reconcile] game ${game.id} has a pending timeout job, skipping`)
+            log.debug({ gameId: game.id }, 'pending timeout job exists — skipping reconcile')
             continue
           }
 
-          // Map FEN turn → active player using whitePlayerId as source of truth
-          const fenTurn   = game.fen && game.fen.length > 0 ? game.fen.split(' ')[1]! : 'w'
-          const whiteIsP1 = game.whitePlayerId === game.player1Id
+          // Load full game state — Redis first, Postgres fallback
+          const state = await loadGameState(publisher, game.id)
+
+          if (!state || state === 'finished') {
+            log.debug({ gameId: game.id }, 'game not in Redis and not active — skipping')
+            continue
+          }
+
+          if (state.status !== 'active') {
+            log.debug({ gameId: game.id, status: state.status }, 'game not active — skipping')
+            continue
+          }
+
+          // Double-check staleness against the Redis hash's lastMoveAt
+          // (which may differ from Postgres if moves were made after the
+          // Postgres lastMoveAt was last written)
+          const lastMoveAge = Date.now() - state.lastMoveAt
+          if (lastMoveAge < STALE_THRESHOLD_MS) {
+            log.debug({ gameId: game.id, lastMoveAge }, 'game not stale per Redis — skipping')
+            continue
+          }
+
+          // Map FEN turn → active player
+          const fenTurn   = state.fen.split(' ')[1] ?? 'w'
+          const whiteIsP1 = state.whitePlayerId === state.player1Id
           const isP1Turn  = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1
-          const winnerId  = isP1Turn ? game.player2Id : game.player1Id
+          const winnerId  = isP1Turn ? state.player2Id : state.player1Id
 
-          console.log(`[reconcile] force-finishing game ${game.id} (winner: ${winnerId})`)
-
-          const gameMode   = (game.mode ?? 'standard') as GameMode
-          const gamesField = GAMES_PLAYED_FIELD[gameMode]
+          log.info({ gameId: game.id, winnerId }, 'force-finishing stale game')
 
           const result = await finalizeGame(
             game.id,
             winnerId,
-            game.player1Id,
-            game.player2Id,
-            game.player1EloBefore ?? 1200,
-            game.player2EloBefore ?? 1200,
-            game.player1[gamesField] ?? 0,
-            game.player2[gamesField] ?? 0,
+            state.player1Id,
+            state.player2Id,
+            state.player1EloBefore,
+            state.player2EloBefore,
+            state.player1GamesPlayed,
+            state.player2GamesPlayed,
             'timeout',
-            gameMode,
-            game.isFriendGame ?? false,
+            (state.mode ?? 'standard') as GameMode,
+            state.isFriendGame,
+            publisher,
           )
 
           if (result) {
@@ -98,16 +118,17 @@ export function createReconcileWorker(publisher: RedisClientType) {
               eloChange:       result.eloChange,
             })
           }
+
         } catch (err: any) {
-          console.error(`[reconcile] failed to process game ${game.id}:`, err.message)
+          log.error({ gameId: game.id, err: err.message }, 'failed to process stale game')
         }
       }
     },
     { connection: redisOpts, concurrency: 1 },
   )
 
-  worker.on('failed', (job, err) => console.error(`[reconcile-worker] job ${job?.id} failed:`, err.message))
-  worker.on('error',  (err)      => console.error('[reconcile-worker] error:', err.message))
+  worker.on('failed', (job, err) => log.error({ jobId: job?.id, err: err.message }, 'reconcile worker job failed'))
+  worker.on('error',  (err)      => log.error({ err: err.message }, 'reconcile worker error'))
 
   return worker
 }

@@ -1,4 +1,4 @@
-// app/api/game/[id]/move/route.ts
+// apps/web/src/app/api/game/[id]/move/route.ts
 // CHANGES from original:
 //   - checkCsrf added (Step 3)
 //   - publishGameUpdate added alongside emitToGame for Redis fan-out

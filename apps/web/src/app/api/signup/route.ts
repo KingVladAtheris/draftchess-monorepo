@@ -1,4 +1,4 @@
-// src/app/api/signup/route.ts
+// apps/web/src/app/api/signup/route.ts
 // CHANGE: uses consumeAuth (fail-closed) instead of consume.
 import { prisma } from "@draftchess/db";
 import bcrypt from "bcrypt";

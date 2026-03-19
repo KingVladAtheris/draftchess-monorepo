@@ -1,4 +1,4 @@
-// src/app/api/profile/[username]/route.ts
+// apps/web/src/app/api/profile/[username]/route.ts
 // Public profile endpoint — no auth required.
 // Returns everything needed to render the full profile page.
 

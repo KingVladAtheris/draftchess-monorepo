@@ -1,4 +1,4 @@
-// app/api/game/[id]/place/route.ts
+// apps/web/src/app/api/game/[id]/place/route.ts
 // CHANGES from original:
 //   - checkCsrf added (Step 3)
 //   - masking moved to server.ts subscriber; place route publishes raw FEN via Redis

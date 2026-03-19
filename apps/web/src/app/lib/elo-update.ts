@@ -1,4 +1,4 @@
-// src/app/lib/elo-update.ts
+// apps/web/src/app/lib/elo-update.ts
 //
 // CHANGES:
 //   - Now accepts `mode` parameter and updates the correct per-mode ELO /

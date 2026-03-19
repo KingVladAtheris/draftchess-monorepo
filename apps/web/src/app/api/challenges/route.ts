@@ -1,4 +1,4 @@
-// src/app/api/challenges/route.ts
+// apps/web/src/app/api/challenges/route.ts
 // POST — send a game challenge to a friend.
 //
 // Rules:

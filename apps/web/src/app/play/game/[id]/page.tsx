@@ -1,4 +1,4 @@
-// app/play/game/[id]/page.tsx
+// apps/web/src/app/play/game/[id]/page.tsx
 import { auth } from "@/auth";
 import { prisma } from "@draftchess/db";
 import { redirect } from "next/navigation";

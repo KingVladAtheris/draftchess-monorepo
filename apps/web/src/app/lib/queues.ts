@@ -1,4 +1,4 @@
-// src/app/lib/queues.ts
+// apps/web/src/app/lib/queues.ts
 // BullMQ queue instances used by Next.js API routes to schedule and cancel
 // timeout jobs. Workers run in the matchmaker container.
 //

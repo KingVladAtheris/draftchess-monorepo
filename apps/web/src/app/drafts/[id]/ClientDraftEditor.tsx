@@ -1,4 +1,4 @@
-// src/app/drafts/[id]/ClientDraftEditor.tsx
+// apps/web/src/app/drafts/[id]/ClientDraftEditor.tsx
 // CHANGES vs original:
 //   - Props extended with `mode: GameMode` and `budget: number`.
 //   - `maxPoints = 33` replaced with `budget` prop throughout.

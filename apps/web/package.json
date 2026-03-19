@@ -11,6 +11,8 @@
     "clean": "rm -rf .next"
   },
   "dependencies": {
+    "@draftchess/logger": "workspace:*",
+    "@draftchess/game-state": "workspace:*",
     "@draftchess/db": "workspace:*",
     "@draftchess/shared": "workspace:*",
     "@draftchess/socket-types": "workspace:*",

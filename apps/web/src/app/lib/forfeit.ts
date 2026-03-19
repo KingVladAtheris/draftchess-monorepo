@@ -1,4 +1,4 @@
-// src/app/lib/forfeit.ts
+// apps/web/src/app/lib/forfeit.ts
 // FIXES:
 //   - Selects per-mode gamesPlayed fields instead of deleted flat gamesPlayed.
 //   - Passes game.mode and game.isFriendGame to updateGameResult.

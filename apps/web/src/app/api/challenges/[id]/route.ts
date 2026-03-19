@@ -1,4 +1,4 @@
-// src/app/api/challenges/[id]/route.ts
+// apps/web/src/app/api/challenges/[id]/route.ts
 //
 // PATCH { action: "accept" | "decline" }
 //   - accept: creates a Game in "prep" status (isFriendGame=true), marks challenge accepted.

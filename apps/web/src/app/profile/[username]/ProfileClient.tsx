@@ -1,5 +1,5 @@
 "use client";
-// src/app/profile/[username]/ProfileClient.tsx
+// apps/web/src/app/profile/[username]/ProfileClient.tsx
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";

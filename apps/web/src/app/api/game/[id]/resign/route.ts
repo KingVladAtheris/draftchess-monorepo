@@ -1,4 +1,4 @@
-// src/app/api/game/[id]/resign/route.ts
+// apps/web/src/app/api/game/[id]/resign/route.ts
 // CHANGE: checkCsrf added.
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";

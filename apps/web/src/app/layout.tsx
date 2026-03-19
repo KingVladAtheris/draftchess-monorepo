@@ -1,4 +1,4 @@
-// src/app/layout.tsx
+// apps/web/src/app/layout.tsx
 // CHANGE: Wrapped with ToastProvider so any client component in the tree
 // can call useToast() without prop-drilling.
 import type { Metadata } from "next";

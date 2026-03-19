@@ -1,4 +1,4 @@
-// src/app/play/select/SelectClient.tsx
+// apps/web/src/app/play/select/SelectClient.tsx
 // CHANGES:
 //   - Accepts `mode` and `budget` props so it works for all three game modes.
 //   - DraftOption and QueuePanel display the correct per-mode point budget.

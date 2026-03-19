@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir":    "./dist",
+    "rootDir":   "./src",
+    "composite": true,
+    "paths": {
+      "@draftchess/db":      ["../../packages/db/src/index.ts"],
+      "@draftchess/shared":  ["../../packages/shared/src/index.ts"],
+      "@draftchess/shared/*":["../../packages/shared/src/*.ts"],
+      "@draftchess/logger":  ["../../packages/logger/src/index.ts"]
+    }
+  },
+  "references": [
+    { "path": "../../packages/db" },
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/logger" }
+  ],
+  "include": ["src"]
+}

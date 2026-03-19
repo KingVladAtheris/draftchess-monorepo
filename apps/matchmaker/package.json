@@ -10,6 +10,8 @@
     "clean":     "rm -rf dist"
   },
   "dependencies": {
+    "@draftchess/logger": "workspace:*",
+    "@draftchess/game-state": "workspace:*",
     "@draftchess/db":     "workspace:*",
     "@draftchess/shared": "workspace:*",
     "bullmq":             "^5.0.0",

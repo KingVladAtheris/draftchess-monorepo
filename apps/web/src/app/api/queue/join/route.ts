@@ -1,4 +1,4 @@
-// src/app/api/queue/join/route.ts
+// apps/web/src/app/api/queue/join/route.ts
 // CHANGES:
 //   - Reads draft.mode and validates the draft budget is correct for that mode.
 //   - Writes queuedMode to the user record alongside queuedDraftId.

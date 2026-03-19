@@ -1,4 +1,4 @@
-// src/app/profile/[username]/page.tsx
+// apps/web/src/app/profile/page.tsx
 import { notFound } from "next/navigation";
 import { prisma } from "@draftchess/db";
 import { auth } from "@/auth";

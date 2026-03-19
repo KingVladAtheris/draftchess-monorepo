@@ -1,4 +1,4 @@
-// src/app/api/notifications/route.ts
+// apps/web/src/app/api/notifications/route.ts
 // GET — returns pending friend requests AND pending game challenges for the
 //        current user, shaped as a generic notifications array.
 

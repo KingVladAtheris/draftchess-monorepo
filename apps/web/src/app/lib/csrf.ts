@@ -1,4 +1,4 @@
-// src/app/lib/csrf.ts
+// apps/web/src/app/lib/csrf.ts
 //
 // Lightweight CSRF protection for cookie-authenticated POST routes.
 //

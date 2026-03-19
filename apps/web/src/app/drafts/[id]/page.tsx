@@ -1,4 +1,4 @@
-// src/app/drafts/[id]/page.tsx
+// apps/web/src/app/drafts/[id]/page.tsx
 // CHANGES:
 //   - Fetches draft.mode alongside existing fields.
 //   - Derives budget from mode via modeBudget().

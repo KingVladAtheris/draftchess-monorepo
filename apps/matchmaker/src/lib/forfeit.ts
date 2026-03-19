@@ -1,16 +1,22 @@
 // apps/matchmaker/src/lib/forfeit.ts
-// Ported from apps/web/src/app/lib/forfeit.ts.
-// Lives in the matchmaker because it needs to call finalizeGame() and
-// cancel BullMQ timeout jobs — both of which live here.
-// The socket server triggers it by publishing to draftchess:forfeit;
-// the forfeit subscriber in this process receives that and calls forfeitGame().
+//
+// Handles player forfeit when their presence grace period expires.
+// Called by the forfeit subscriber when the socket server publishes
+// to draftchess:forfeit after a player disconnects and doesn't reconnect.
+//
+// Reads game state from Redis (fast path) with Postgres fallback via
+// loadGameState. Passes publisher to finalizeGame for Redis cleanup.
 
 import { prisma }            from '@draftchess/db'
-import { type GameMode, GAMES_PLAYED_FIELD } from '@draftchess/shared/game-modes'
+import { type GameMode }     from '@draftchess/shared/game-modes'
+import { loadGameState }     from '@draftchess/game-state'
 import { finalizeGame }      from './finalize.js'
 import { publishGameUpdate } from './notify.js'
 import { cancelTimeoutJob }  from '../queues.js'
+import { logger }            from '@draftchess/logger'
 import type { RedisClientType } from 'redis'
+
+const log = logger.child({ module: 'matchmaker:forfeit' })
 
 export async function forfeitGame(
   gameId:    number,
@@ -18,65 +24,44 @@ export async function forfeitGame(
   publisher: RedisClientType,
 ): Promise<void> {
 
-  const game = await prisma.game.findUnique({
-    where:  { id: gameId },
-    select: {
-      status:           true,
-      mode:             true,
-      isFriendGame:     true,
-      player1Id:        true,
-      player2Id:        true,
-      player1EloBefore: true,
-      player2EloBefore: true,
-      player1: {
-        select: {
-          gamesPlayedStandard: true,
-          gamesPlayedPauper:   true,
-          gamesPlayedRoyal:    true,
-        },
-      },
-      player2: {
-        select: {
-          gamesPlayedStandard: true,
-          gamesPlayedPauper:   true,
-          gamesPlayedRoyal:    true,
-        },
-      },
-    },
-  })
+  // Load game state — Redis first, Postgres fallback
+  const state = await loadGameState(publisher, gameId)
 
-  if (!game) {
-    console.warn(`[forfeit] game ${gameId} not found`)
+  if (!state) {
+    log.warn({ gameId }, 'game not found in Redis or Postgres')
     return
   }
 
-  if (game.status !== 'active' && game.status !== 'prep') {
-    console.log(`[forfeit] game ${gameId} already finished (status: ${game.status}), skipping`)
+  if (state === 'finished') {
+    log.info({ gameId }, 'game already finished — skipping forfeit')
     return
   }
 
-  const isPlayer1 = game.player1Id === userId
-  if (!isPlayer1 && game.player2Id !== userId) {
-    console.warn(`[forfeit] user ${userId} is not a participant in game ${gameId}`)
+  if (state.status !== 'active' && state.status !== 'prep') {
+    log.info({ gameId, status: state.status }, 'game not active or prep — skipping forfeit')
     return
   }
 
-  // For prep games, promote to active so finalizeGame's guard can fire.
+  const isPlayer1 = state.player1Id === userId
+  if (!isPlayer1 && state.player2Id !== userId) {
+    log.warn({ gameId, userId }, 'user is not a participant in game')
+    return
+  }
+
+  // For prep games, promote to active so finalizeGame's Postgres guard can fire.
   // updateMany is atomic — if the ready route already resolved prep, count=0 and we bail.
-  if (game.status === 'prep') {
+  if (state.status === 'prep') {
     const promoted = await prisma.game.updateMany({
       where: { id: gameId, status: 'prep' },
       data:  { status: 'active' },
     })
     if (promoted.count === 0) {
-      console.log(`[forfeit] game ${gameId} prep already resolved, skipping`)
+      log.info({ gameId }, 'prep already resolved by another path — skipping forfeit')
       return
     }
   }
 
-  const winnerId   = isPlayer1 ? game.player2Id : game.player1Id
-  const gameMode   = (game.mode ?? 'standard') as GameMode
-  const gamesField = GAMES_PLAYED_FIELD[gameMode]
+  const winnerId = isPlayer1 ? state.player2Id : state.player1Id
 
   // cancelTimeoutJob is idempotent — always call it so we never leave
   // an orphaned BullMQ job regardless of what finalizeGame returns.
@@ -85,20 +70,20 @@ export async function forfeitGame(
   const result = await finalizeGame(
     gameId,
     winnerId,
-    game.player1Id,
-    game.player2Id,
-    game.player1EloBefore ?? 1200,
-    game.player2EloBefore ?? 1200,
-    game.player1[gamesField] ?? 0,
-    game.player2[gamesField] ?? 0,
+    state.player1Id,
+    state.player2Id,
+    state.player1EloBefore,
+    state.player2EloBefore,
+    state.player1GamesPlayed,
+    state.player2GamesPlayed,
     'abandoned',
-    gameMode,
-    game.isFriendGame === true,
+    (state.mode ?? 'standard') as GameMode,
+    state.isFriendGame,
+    publisher,
   )
 
   if (!result) {
-    // finalizeGame saw status !== 'active' — another path already finished the game.
-    console.log(`[forfeit] game ${gameId} already finished by another path, skipping`)
+    log.info({ gameId }, 'game already finished by another path — skipping forfeit')
     return
   }
 
@@ -111,5 +96,5 @@ export async function forfeitGame(
     eloChange:       result.eloChange,
   })
 
-  console.log(`[forfeit] game ${gameId}: user ${userId} forfeited, winner: ${winnerId}`)
+  log.info({ gameId, userId, winnerId }, 'forfeit processed')
 }

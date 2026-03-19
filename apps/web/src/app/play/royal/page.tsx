@@ -1,4 +1,4 @@
-// src/app/play/royal/page.tsx — server component
+// apps/web/src/app/play/royal/page.tsx
 import { auth } from "@/auth";
 import { prisma } from "@draftchess/db";
 import { redirect } from "next/navigation";

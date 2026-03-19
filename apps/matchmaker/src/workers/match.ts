@@ -1,15 +1,22 @@
 // apps/matchmaker/src/workers/match.ts
-import { Worker }          from 'bullmq'
-import { prisma }          from '@draftchess/db'
+
+import { Worker }                from 'bullmq'
+import { prisma }                from '@draftchess/db'
 import { buildCombinedDraftFen } from '@draftchess/shared/fen-utils'
 import {
   type GameMode,
   MODE_CONFIG,
   ELO_FIELD,
+  GAMES_PLAYED_FIELD,
 } from '@draftchess/shared/game-modes'
-import { notifyMatch }     from '../lib/notify.js'
+import { seedGameState }         from '@draftchess/game-state'
+import { notifyMatch }           from '../lib/notify.js'
 import { matchQueue, prepQueue, redisOpts } from '../queues.js'
-import type { RedisClientType } from 'redis'
+import { logger }                from '@draftchess/logger'
+import type { RedisClientType }  from 'redis'
+import type { SeedGameStatePayload } from '@draftchess/game-state'
+
+const log = logger.child({ module: 'matchmaker:match-worker' })
 
 // ── ELO pairing helpers ───────────────────────────────────────────────────────
 
@@ -23,10 +30,13 @@ type QueuedPlayer = {
   username:      string
   queuedDraftId: number | null
   queuedMode:    string | null
-  queuedAt:      Date | null  // nullable in schema — Prisma returns Date | null
+  queuedAt:      Date | null
   eloStandard:   number
   eloPauper:     number
   eloRoyal:      number
+  gamesPlayedStandard: number
+  gamesPlayedPauper:   number
+  gamesPlayedRoyal:    number
 }
 
 function findBestMatch(
@@ -37,11 +47,10 @@ function findBestMatch(
 
   const sameMode = candidates.filter(p => p.queuedMode === target.queuedMode)
   if (sameMode.length === 0) {
-    console.log(`[match] no opponents in same mode (${target.queuedMode}) for ${target.username}`)
+    log.debug({ username: target.username, mode: target.queuedMode }, 'no opponents in same mode')
     return null
   }
 
-  // queuedAt should always be set for queued players, but guard against null
   const queuedAtMs   = target.queuedAt ? new Date(target.queuedAt).getTime() : Date.now()
   const mode         = (target.queuedMode ?? 'standard') as GameMode
   const modeEloField = ELO_FIELD[mode]
@@ -54,9 +63,9 @@ function findBestMatch(
 
   const best = sorted[0]!
   if (best.diff > limit) {
-    console.log(
-      `[match] no suitable opponent for ${target.username} ` +
-      `(mode=${mode}, diff=${best.diff}, limit=${limit})`,
+    log.debug(
+      { username: target.username, mode, diff: best.diff, limit },
+      'no suitable opponent within ELO range',
     )
     return null
   }
@@ -77,6 +86,9 @@ export function createMatchWorker(publisher: RedisClientType) {
           id: true, username: true,
           queuedDraftId: true, queuedMode: true, queuedAt: true,
           eloStandard: true, eloPauper: true, eloRoyal: true,
+          gamesPlayedStandard: true,
+          gamesPlayedPauper:   true,
+          gamesPlayedRoyal:    true,
         },
       })
 
@@ -88,12 +100,14 @@ export function createMatchWorker(publisher: RedisClientType) {
 
       const mode         = (player1.queuedMode ?? 'standard') as GameMode
       const modeEloField = ELO_FIELD[mode]
+      const gamesField   = GAMES_PLAYED_FIELD[mode]
       const p1Elo        = player1[modeEloField] ?? 1200
       const p2Elo        = player2[modeEloField] ?? 1200
       const auxPoints    = MODE_CONFIG[mode].auxPoints
 
-      console.log(
-        `[match] pairing ${player1.username} (${p1Elo}) vs ${player2.username} (${p2Elo}) mode=${mode}`,
+      log.info(
+        { p1: player1.username, p1Elo, p2: player2.username, p2Elo, mode },
+        'pairing players',
       )
 
       const [draft1, draft2] = await Promise.all([
@@ -102,7 +116,7 @@ export function createMatchWorker(publisher: RedisClientType) {
       ])
 
       if (!draft1 || !draft2) {
-        console.error('[match] draft not found, clearing players from queue')
+        log.error({ p1: player1.username, p2: player2.username }, 'draft not found — clearing from queue')
         await prisma.user.updateMany({
           where: { id: { in: [player1.id, player2.id] } },
           data:  { queueStatus: 'offline', queuedAt: null, queuedDraftId: null },
@@ -111,10 +125,9 @@ export function createMatchWorker(publisher: RedisClientType) {
       }
 
       const isPlayer1White = Math.random() > 0.5
-      const gameFen = buildCombinedDraftFen(
-        isPlayer1White ? draft1.fen : draft2.fen,
-        isPlayer1White ? draft2.fen : draft1.fen,
-      )
+      const whiteDraftFen  = isPlayer1White ? draft1.fen : draft2.fen
+      const blackDraftFen  = isPlayer1White ? draft2.fen : draft1.fen
+      const gameFen        = buildCombinedDraftFen(whiteDraftFen, blackDraftFen)
 
       const now  = new Date()
       const game = await prisma.game.create({
@@ -137,6 +150,32 @@ export function createMatchWorker(publisher: RedisClientType) {
         },
       })
 
+      // ── Seed Redis game hash ───────────────────────────────────────────────
+      // Must happen immediately after Postgres write so every subsequent
+      // operation (place, ready, move) reads from Redis, not Postgres.
+      const seedPayload: SeedGameStatePayload = {
+        gameId:        game.id,
+        player1Id:     player1.id,
+        player2Id:     player2.id,
+        whitePlayerId: isPlayer1White ? player1.id : player2.id,
+        mode,
+        isFriendGame:  false,
+        fen:           gameFen,
+        prepStartedAt: now.getTime(),
+        auxPointsPlayer1: auxPoints,
+        auxPointsPlayer2: auxPoints,
+        player1Timebank:  60_000,
+        player2Timebank:  60_000,
+        draft1Fen: whiteDraftFen,
+        draft2Fen: blackDraftFen,
+        player1EloBefore:   p1Elo,
+        player2EloBefore:   p2Elo,
+        player1GamesPlayed: player1[gamesField] ?? 0,
+        player2GamesPlayed: player2[gamesField] ?? 0,
+      }
+
+      await seedGameState(publisher, seedPayload)
+
       await prisma.user.updateMany({
         where: { id: { in: [player1.id, player2.id] } },
         data:  { queueStatus: 'in_game', queuedAt: null, queuedDraftId: null },
@@ -150,21 +189,21 @@ export function createMatchWorker(publisher: RedisClientType) {
         { delay: 62_000, jobId: `prep-${game.id}` },
       )
 
-      console.log(`[match] game ${game.id} created`)
+      log.info({ gameId: game.id, mode, p1: player1.username, p2: player2.username }, 'game created')
     },
     { connection: redisOpts, concurrency: 1 },
   )
 
   worker.on('failed', (job, err) => {
-    console.error(`[match-worker] job ${job?.id} failed:`, err.message)
+    log.error({ jobId: job?.id, err: err.message }, 'match worker job failed')
     if (job?.name === 'try-match') {
       matchQueue
         .add('try-match', {}, { delay: 5_000 })
-        .catch(e => console.error('[match-worker] re-queue failed:', e.message))
+        .catch(e => log.error({ err: e.message }, 'match worker re-queue failed'))
     }
   })
 
-  worker.on('error', (err) => console.error('[match-worker] error:', err.message))
+  worker.on('error', (err) => log.error({ err: err.message }, 'match worker error'))
 
   return worker
 }

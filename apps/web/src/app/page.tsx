@@ -1,4 +1,4 @@
-// src/app/page.tsx
+// apps/web/src/app/page.tsx
 // Home page — communicates the Draft Chess game loop at a glance.
 // Z-pattern layout: logo/headline top-left, board motif top-right,
 // game loop steps centre, single CTA bottom-right of the Z.

@@ -1,4 +1,4 @@
-// src/app/drafts/page.tsx
+// apps/web/src/app/drafts/page.tsx
 // CHANGES:
 //   - Drafts split into per-mode sections (Standard / Pauper / Royal) with anchor IDs.
 //   - Each section has its own "New draft" button and correct point budget.

@@ -1,4 +1,4 @@
-// src/app/api/auth/[...nextauth]/route.ts
+// apps/web/src/app/api/auth/[...nextauth]/route.ts
 // CHANGE: Wraps NextAuth POST with fail-closed login rate limiting.
 // GET (session fetch, CSRF token) is not rate-limited.
 // The loginLimiter is keyed by IP since the user isn't authenticated yet.

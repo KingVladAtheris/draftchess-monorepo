@@ -11,6 +11,8 @@
     "clean":     "rm -rf dist tsconfig.tsbuildinfo"
   },
   "dependencies": {
+    "@draftchess/logger": "workspace:*",
+    "@draftchess/game-state": "workspace:*",
     "@draftchess/db":           "workspace:*",
     "@draftchess/shared":       "workspace:*",
     "@draftchess/socket-types": "workspace:*",

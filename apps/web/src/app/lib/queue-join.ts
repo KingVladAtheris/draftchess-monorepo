@@ -1,4 +1,4 @@
-// src/app/lib/queue-join.ts
+// apps/web/src/app/lib/queue-join.ts
 // Call this from your queue-join API route after setting queueStatus = 'queued'.
 // It adds a 'try-match' job immediately so the matchmaker wakes up without
 // waiting for a polling interval.

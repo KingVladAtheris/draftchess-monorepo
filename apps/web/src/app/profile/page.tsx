@@ -1,4 +1,4 @@
-// src/app/profile/page.tsx
+// apps/web/src/app/profile/page.tsx
 // Redirects /profile → /profile/[username] for the logged-in user.
 // If not logged in, redirects to /login.
 //

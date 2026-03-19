@@ -4,9 +4,12 @@
 // Having one module own the Queue instances avoids creating duplicate connections.
 
 import { Queue } from 'bullmq'
+import { logger } from '@draftchess/logger'
+
+const log = logger.child({ module: 'matchmaker:queues' })
 
 if (!process.env.REDIS_URL) {
-  console.error('[queues] REDIS_URL is required')
+  log.fatal('REDIS_URL is required')
   process.exit(1)
 }
 
@@ -19,7 +22,7 @@ function parseRedisUrl(url: string) {
   }
 }
 
-const redisOpts    = parseRedisUrl(process.env.REDIS_URL!)
+const redisOpts      = parseRedisUrl(process.env.REDIS_URL!)
 const defaultJobOpts = { removeOnComplete: 100, removeOnFail: 200 }
 
 export const matchQueue     = new Queue('match-queue',     { connection: redisOpts, defaultJobOptions: defaultJobOpts })
@@ -33,7 +36,7 @@ export { redisOpts }
  * Schedule (or replace) the timeout job for a game.
  * delay = 30s move limit + active player's timebank.
  *
- * fenTurn:  'w' or 'b' from the FEN string
+ * fenTurn:   'w' or 'b' from the FEN string
  * whiteIsP1: whether whitePlayerId === player1Id
  * Both are required to correctly map FEN colour → player slot.
  */
@@ -45,7 +48,7 @@ export async function scheduleTimeout(
   fenTurn          = 'w',
   whiteIsP1        = true,
 ): Promise<void> {
-  const isP1Turn      = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1
+  const isP1Turn       = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1
   const activeTimebank = isP1Turn ? player1Timebank : player2Timebank
   const delay          = 30_000 + Math.max(0, activeTimebank)
 
@@ -56,7 +59,7 @@ export async function scheduleTimeout(
     const existing = await timeoutQueue.getJob(`timeout-${gameId}`)
     if (existing) await existing.remove()
   } catch (err: any) {
-    console.warn(`[queues] could not remove previous timeout job for game ${gameId}:`, err.message)
+    log.warn({ gameId, err: err.message }, 'could not remove previous timeout job')
   }
 
   await timeoutQueue.add(
@@ -78,6 +81,6 @@ export async function cancelTimeoutJob(gameId: number): Promise<void> {
     const job = await timeoutQueue.getJob(`timeout-${gameId}`)
     if (job) await job.remove()
   } catch (err: any) {
-    console.warn(`[queues] cancelTimeoutJob for game ${gameId} failed:`, err.message)
+    log.warn({ gameId, err: err.message }, 'cancelTimeoutJob failed')
   }
 }

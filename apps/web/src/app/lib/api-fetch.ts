@@ -1,4 +1,4 @@
-// src/app/lib/api-fetch.ts
+// apps/web/src/app/lib/api-fetch.ts
 // 
 // Drop-in fetch wrapper used by all client components.
 // Automatically appends X-DraftChess-CSRF: 1 to every request so individual

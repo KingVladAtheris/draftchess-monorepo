@@ -1,4 +1,4 @@
-// src/app/api/profile/[username]/following/route.ts
+// apps/web/src/app/api/profile/[username]/following/route.ts
 // GET — publicly visible list of users that [username] is following.
 // Online status is only included if the viewer is authenticated.
 

@@ -1,4 +1,4 @@
-// src/app/api/friends/[requestId]/route.ts
+// apps/web/src/app/api/friends/[requestId]/route.ts
 // PATCH — accept or decline a pending friend request.
 // DELETE — remove a friend (sets status back to declined, or deletes entirely).
 

@@ -1,4 +1,4 @@
-// app/api/game/[id]/status/route.ts
+// apps/web/src/app/api/game/[id]/status/route.ts
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@draftchess/db";

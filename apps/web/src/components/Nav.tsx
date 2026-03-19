@@ -1,4 +1,4 @@
-// src/components/Nav.tsx
+// apps/web/src/components/Nav.tsx
 // Top navigation bar for Draft Chess.
 //
 // Uses useSession() from next-auth/react so the nav updates reactively

@@ -1,4 +1,14 @@
 // apps/matchmaker/src/lib/finalize.ts
+//
+// Single source of truth for all game finalization.
+// Called by: timeout worker, forfeit subscriber, reconcile worker,
+//            game-ended subscriber (new — replaces web app's updateGameResult).
+//
+// Writes ELO, stats, and game outcome to Postgres.
+// Deletes the Redis game hash after persisting.
+// Never called from the web app — the web app publishes to
+// draftchess:game-ended and this module handles it.
+
 import { Prisma, prisma }              from '@draftchess/db'
 import { calculateEloChange, MIN_ELO } from '@draftchess/shared/elo'
 import {
@@ -9,6 +19,11 @@ import {
   LOSSES_FIELD,
   DRAWS_FIELD,
 } from '@draftchess/shared/game-modes'
+import { deleteGameState }             from '@draftchess/game-state'
+import { logger }                      from '@draftchess/logger'
+import type { RedisClientType }        from 'redis'
+
+const log = logger.child({ module: 'matchmaker:finalize' })
 
 export interface FinalizeResult {
   newP1Elo:  number
@@ -28,9 +43,10 @@ export async function finalizeGame(
   endReason:   string,
   mode:        GameMode = 'standard',
   isFriendGame = false,
+  redis:       RedisClientType,
 ): Promise<FinalizeResult | null> {
 
-  // ── Friend games ────────────────────────────────────────────────────────────
+  // ── Friend games ─────────────────────────────────────────────────────────────
   // Mark finished and clear queue state, but skip ELO / stat updates entirely.
   if (isFriendGame) {
     let finalized = false
@@ -51,15 +67,21 @@ export async function finalizeGame(
         finalized = true
       })
     } catch (err: any) {
-      console.error(`[finalize] game ${gameId} (friend) transaction error:`, err.message)
+      log.error({ gameId, err: err.message }, 'friend game transaction error')
       throw err
     }
+
+    if (finalized) {
+      await deleteGameState(redis, gameId)
+      log.info({ gameId, endReason }, 'friend game finalized')
+    }
+
     return finalized
       ? { newP1Elo: p1EloBefore, newP2Elo: p2EloBefore, eloChange: 0 }
       : null
   }
 
-  // ── ELO calculation ─────────────────────────────────────────────────────────
+  // ── ELO calculation ──────────────────────────────────────────────────────────
   const isDraw = winnerId === null
   let p1Change: number
   let p2Change: number
@@ -82,7 +104,7 @@ export async function finalizeGame(
   const newP2Elo  = Math.max(MIN_ELO, p2EloBefore + p2Change)
   const eloChange = Math.abs(p1Change)
 
-  // ── Persist ─────────────────────────────────────────────────────────────────
+  // ── Persist ──────────────────────────────────────────────────────────────────
   const eloF    = ELO_FIELD[mode]
   const gamesF  = GAMES_PLAYED_FIELD[mode]
   const winsF   = WINS_FIELD[mode]
@@ -140,8 +162,17 @@ export async function finalizeGame(
       finalized = true
     })
   } catch (err: any) {
-    console.error(`[finalize] game ${gameId} transaction error:`, err.message)
+    log.error({ gameId, err: err.message }, 'finalize transaction error')
     throw err
+  }
+
+  if (finalized) {
+    // Delete Redis hash now that Postgres has the final state
+    await deleteGameState(redis, gameId)
+    log.info(
+      { gameId, mode, endReason, newP1Elo, newP2Elo, eloChange },
+      'game finalized',
+    )
   }
 
   return finalized ? { newP1Elo, newP2Elo, eloChange } : null

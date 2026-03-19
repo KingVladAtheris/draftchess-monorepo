@@ -1,4 +1,4 @@
-// src/components/SessionProvider.tsx
+// apps/web/src/components/SessionProvider.tsx
 // Thin wrapper around next-auth/react SessionProvider.
 // Must be a client component since SessionProvider uses React context.
 // Wrap the root layout with this so any client component in the tree

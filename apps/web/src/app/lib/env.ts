@@ -1,4 +1,4 @@
-// src/app/lib/env.ts
+// apps/web/src/app/lib/env.ts
 // Validates required environment variables at process start.
 // Import this at the top of server.ts and any long-running entry point.
 // Throws immediately with a clear message rather than failing mid-request.

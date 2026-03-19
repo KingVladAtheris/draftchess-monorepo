@@ -1,4 +1,4 @@
-// src/app/api/health/route.ts
+// apps/web/src/app/health/route.ts
 // Lightweight liveness + readiness probe for load balancers and orchestrators.
 // Returns 200 when the process is alive and both Postgres and Redis are reachable.
 // Returns 503 with a JSON body explaining which dependency failed.

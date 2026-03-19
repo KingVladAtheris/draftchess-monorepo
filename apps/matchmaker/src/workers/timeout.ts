@@ -1,11 +1,19 @@
 // apps/matchmaker/src/workers/timeout.ts
-import { Worker }       from 'bullmq'
-import { prisma }       from '@draftchess/db'
-import { type GameMode, GAMES_PLAYED_FIELD } from '@draftchess/shared/game-modes'
-import { finalizeGame } from '../lib/finalize.js'
+//
+// Processes timeout jobs scheduled by the game-started subscriber and
+// after every move. Reads game state from Redis (fast path) with Postgres
+// fallback. Passes publisher to finalizeGame so it can delete the Redis hash.
+
+import { Worker }            from 'bullmq'
+import { loadGameState }     from '@draftchess/game-state'
+import { type GameMode }     from '@draftchess/shared/game-modes'
+import { finalizeGame }      from '../lib/finalize.js'
 import { publishGameUpdate } from '../lib/notify.js'
 import { timeoutQueue, redisOpts } from '../queues.js'
+import { logger }            from '@draftchess/logger'
 import type { RedisClientType } from 'redis'
+
+const log = logger.child({ module: 'matchmaker:timeout-worker' })
 
 export function createTimeoutWorker(publisher: RedisClientType) {
   const worker = new Worker(
@@ -13,53 +21,41 @@ export function createTimeoutWorker(publisher: RedisClientType) {
     async (job) => {
       const { gameId, scheduledAt } = job.data as { gameId: number; scheduledAt: string }
 
-      const game = await prisma.game.findUnique({
-        where:  { id: gameId },
-        select: {
-          id: true, status: true, fen: true, mode: true, isFriendGame: true,
-          player1Id: true, player2Id: true, whitePlayerId: true,
-          lastMoveAt: true, player1Timebank: true, player2Timebank: true,
-          player1EloBefore: true, player2EloBefore: true,
-          player1: {
-            select: {
-              gamesPlayedStandard: true,
-              gamesPlayedPauper:   true,
-              gamesPlayedRoyal:    true,
-              username:            true,
-            },
-          },
-          player2: {
-            select: {
-              gamesPlayedStandard: true,
-              gamesPlayedPauper:   true,
-              gamesPlayedRoyal:    true,
-              username:            true,
-            },
-          },
-        },
-      })
+      // ── Load game state from Redis (fast path) ──────────────────────────────
+      const state = await loadGameState(publisher, gameId)
 
-      if (!game || game.status !== 'active') {
-        console.log(`[timeout] game ${gameId} not active, skipping`)
+      if (!state || state === 'finished') {
+        log.debug({ gameId }, 'game not active or finished — skipping timeout')
         return
       }
 
-      // Staleness check — if the move timestamp no longer matches what was
-      // scheduled, a newer move was made and this job is stale.
-      if (game.lastMoveAt && new Date(game.lastMoveAt).toISOString() !== scheduledAt) {
-        console.log(`[timeout] game ${gameId} stale job (lastMoveAt changed), skipping`)
+      if (state.status !== 'active') {
+        log.debug({ gameId, status: state.status }, 'game not active — skipping timeout')
         return
       }
 
-      const now      = Date.now()
-      const elapsed  = now - new Date(game.lastMoveAt!).getTime()
-      const turn     = game.fen!.split(' ')[1]! // 'w' or 'b'
+      // ── Staleness check ─────────────────────────────────────────────────────
+      // If lastMoveAt no longer matches what was scheduled, a newer move was
+      // made after this job was enqueued. Discard silently.
+      const lastMoveAtIso = state.lastMoveAt
+        ? new Date(state.lastMoveAt).toISOString()
+        : null
+
+      if (lastMoveAtIso !== scheduledAt) {
+        log.debug({ gameId, scheduledAt, lastMoveAt: lastMoveAtIso }, 'stale timeout job — skipping')
+        return
+      }
+
+      // ── Time accounting ─────────────────────────────────────────────────────
+      const now     = Date.now()
+      const elapsed = now - state.lastMoveAt
+      const fenTurn = state.fen.split(' ')[1] ?? 'w'
 
       // Map FEN colour → player slot using whitePlayerId as source of truth
-      const whiteIsP1 = game.whitePlayerId === game.player1Id
-      const isP1Turn  = turn === 'w' ? whiteIsP1 : !whiteIsP1
+      const whiteIsP1 = state.whitePlayerId === state.player1Id
+      const isP1Turn  = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1
 
-      const timebank  = isP1Turn ? game.player1Timebank : game.player2Timebank
+      const timebank  = isP1Turn ? state.player1Timebank : state.player2Timebank
       const remaining = timebank - Math.max(0, elapsed - 30_000)
 
       if (remaining > 0) {
@@ -69,29 +65,30 @@ export function createTimeoutWorker(publisher: RedisClientType) {
           { gameId, scheduledAt },
           { delay: remaining, jobId: `timeout-${gameId}` },
         )
+        log.debug({ gameId, remaining }, 'time remaining — rescheduled')
         return
       }
 
-      const winnerId   = isP1Turn ? game.player2Id : game.player1Id
-      const gameMode   = (game.mode ?? 'standard') as GameMode
-      const gamesField = GAMES_PLAYED_FIELD[gameMode]
+      // ── Time expired — finalize ─────────────────────────────────────────────
+      const winnerId = isP1Turn ? state.player2Id : state.player1Id
 
       const result = await finalizeGame(
         gameId,
         winnerId,
-        game.player1Id,
-        game.player2Id,
-        game.player1EloBefore ?? 1200,
-        game.player2EloBefore ?? 1200,
-        game.player1[gamesField] ?? 0,
-        game.player2[gamesField] ?? 0,
+        state.player1Id,
+        state.player2Id,
+        state.player1EloBefore,
+        state.player2EloBefore,
+        state.player1GamesPlayed,
+        state.player2GamesPlayed,
         'timeout',
-        gameMode,
-        game.isFriendGame ?? false,
+        (state.mode ?? 'standard') as GameMode,
+        state.isFriendGame,
+        publisher,
       )
 
       if (!result) {
-        console.log(`[timeout] game ${gameId} already finished by another path`)
+        log.info({ gameId }, 'game already finished by another path')
         return
       }
 
@@ -104,13 +101,13 @@ export function createTimeoutWorker(publisher: RedisClientType) {
         eloChange:       result.eloChange,
       })
 
-      console.log(`[timeout] game ${gameId} ended by timeout, winner: ${winnerId}`)
+      log.info({ gameId, winnerId }, 'game ended by timeout')
     },
     { connection: redisOpts, concurrency: 10 },
   )
 
-  worker.on('failed', (job, err) => console.error(`[timeout-worker] job ${job?.id} failed:`, err.message))
-  worker.on('error',  (err)      => console.error('[timeout-worker] error:', err.message))
+  worker.on('failed', (job, err) => log.error({ jobId: job?.id, err: err.message }, 'timeout worker job failed'))
+  worker.on('error',  (err)      => log.error({ err: err.message }, 'timeout worker error'))
 
   return worker
 }

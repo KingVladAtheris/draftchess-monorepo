@@ -1,0 +1,21 @@
+{
+  "name": "@draftchess/game-state",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "redis": "^4.7.0",
+    "@draftchess/db": "workspace:*",
+    "@draftchess/shared": "workspace:*",
+    "@draftchess/logger": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}

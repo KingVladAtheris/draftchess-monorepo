@@ -1,4 +1,4 @@
-// app/play/game/[id]/ClientGame.tsx
+// apps/web/src/app/play/[id]/ClientGame.tsx
 // Redesigned with psychology-informed attention architecture:
 //   - F-pattern: critical info (timer, status) anchored top-left and top-right
 //   - Attentional spotlight: board is the hero; chrome recedes into dark surfaces

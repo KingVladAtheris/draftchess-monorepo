@@ -1,4 +1,4 @@
-// src/app/HomeClient.tsx
+// apps/web/src/app/HomeClient.tsx
 "use client";
 
 import { useEffect, useRef, useState } from "react";

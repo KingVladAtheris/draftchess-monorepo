@@ -1,4 +1,4 @@
-// src/app/lib/rate-limit.ts
+// apps/web/src/app/lib/rate-limit.ts
 //
 // CHANGES:
 //   - Auth limiters (signup, login) now FAIL CLOSED on Redis error.

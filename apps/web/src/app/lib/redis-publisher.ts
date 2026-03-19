@@ -1,4 +1,4 @@
-// src/app/lib/redis-publisher.ts
+// apps/web/src/app/lib/redis-publisher.ts
 //
 // Singleton Redis publisher for use in Next.js API routes.
 // API routes cannot access the Socket.IO instance directly (it lives in the
