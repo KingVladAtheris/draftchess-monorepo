@@ -1,14 +1,3 @@
-// apps/web/src/app/play/[id]/ClientGame.tsx
-// Redesigned with psychology-informed attention architecture:
-//   - F-pattern: critical info (timer, status) anchored top-left and top-right
-//   - Attentional spotlight: board is the hero; chrome recedes into dark surfaces
-//   - Cognitive load reduction: one primary action at a time, grouped semantics
-//   - Urgency salience: timer shifts amber→orange→red as time depletes
-//   - Zeigarnik tension: move bar fills/drains to maintain engagement
-//   - Social presence: opponent status always visible, never hidden
-// CHANGES (Step 8):
-//   - All alert() calls replaced with useToast()
-//   - All fetch() calls replaced with apiFetch() (adds CSRF header automatically)
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
@@ -57,10 +46,10 @@ type ClientGameProps = {
   mode: GameMode;
 };
 
-const MOVE_TIME_LIMIT = 30000;
+const MOVE_TIME_LIMIT       = 30000;
 const TIMEBANK_BONUS_INTERVAL = 20;
+const REMATCH_EXPIRY_MS     = 30000;
 
-// ─── Timer color based on urgency ────────────────────────────────────────────
 function getTimerClass(ms: number, isActive: boolean) {
   if (!isActive) return "text-white/30";
   if (ms <= 0)    return "text-red-400";
@@ -68,15 +57,12 @@ function getTimerClass(ms: number, isActive: boolean) {
   if (ms < 15000) return "text-orange-400";
   return "text-amber-400";
 }
-
 function getTimerBarWidth(ms: number): number {
   return Math.max(0, Math.min(100, (ms / MOVE_TIME_LIMIT) * 100));
 }
-
 function getTimerBarClass(ms: number): string {
-  if (ms <= 0)    return "bg-red-500";
-  if (ms < 8000)  return "bg-red-500";
-  if (ms < 15000) return "bg-orange-400";
+  if (ms <= 0 || ms < 8000)  return "bg-red-500";
+  if (ms < 15000)             return "bg-orange-400";
   return "bg-amber-400";
 }
 
@@ -88,27 +74,47 @@ export default function ClientGame({
 
   const toast = useToast();
 
-  const [fen, setFen]                           = useState(initialFen);
-  const [status, setStatus]                     = useState<GameStatus>(initialStatus as GameStatus);
-  const [prepStartedAt, setPrepStartedAt]       = useState<Date | null>(initialPrepStartedAt);
-  const [readyPlayer1, setReadyPlayer1]         = useState(initialReadyPlayer1);
-  const [readyPlayer2, setReadyPlayer2]         = useState(initialReadyPlayer2);
-  const [auxPointsPlayer1, setAuxPointsPlayer1] = useState(initialAuxPointsPlayer1);
-  const [auxPointsPlayer2, setAuxPointsPlayer2] = useState(initialAuxPointsPlayer2);
-  const [player1Timebank, setPlayer1Timebank]   = useState(60000);
-  const [player2Timebank, setPlayer2Timebank]   = useState(60000);
-  const [lastMoveAt, setLastMoveAt]             = useState<Date | null>(null);
+  const [fen, setFen]                             = useState(initialFen);
+  const [status, setStatus]                       = useState<GameStatus>(initialStatus as GameStatus);
+  const [prepStartedAt, setPrepStartedAt]         = useState<Date | null>(initialPrepStartedAt);
+  const [readyPlayer1, setReadyPlayer1]           = useState(initialReadyPlayer1);
+  const [readyPlayer2, setReadyPlayer2]           = useState(initialReadyPlayer2);
+  const [auxPointsPlayer1, setAuxPointsPlayer1]   = useState(initialAuxPointsPlayer1);
+  const [auxPointsPlayer2, setAuxPointsPlayer2]   = useState(initialAuxPointsPlayer2);
+  const [player1Timebank, setPlayer1Timebank]     = useState(60000);
+  const [player2Timebank, setPlayer2Timebank]     = useState(60000);
+  const [lastMoveAt, setLastMoveAt]               = useState<Date | null>(null);
   const [moveTimeRemaining, setMoveTimeRemaining] = useState(MOVE_TIME_LIMIT);
   const [prepTimeRemaining, setPrepTimeRemaining] = useState(60);
-  const [moveNumber, setMoveNumber]             = useState(0);
+  const [moveNumber, setMoveNumber]               = useState(0);
   const [showTimebankBonus, setShowTimebankBonus] = useState(false);
-  const [gameResult, setGameResult]             = useState<GameResult | null>(null);
-  const [socketError, setSocketError]           = useState<string | null>(null);
-  const [activePiece, setActivePiece]           = useState<string | null>(null);
-  const [legalSquares, setLegalSquares]         = useState<string[]>([]);
-  const [illegalSquares, setIllegalSquares]     = useState<string[]>([]);
-  const [pendingPromotion, setPendingPromotion] = useState<PendingPromotion | null>(null);
+  const [gameResult, setGameResult]               = useState<GameResult | null>(null);
+  const [socketError, setSocketError]             = useState<string | null>(null);
+  const [activePiece, setActivePiece]             = useState<string | null>(null);
+  const [legalSquares, setLegalSquares]           = useState<string[]>([]);
+  const [illegalSquares, setIllegalSquares]       = useState<string[]>([]);
+  const [pendingPromotion, setPendingPromotion]   = useState<PendingPromotion | null>(null);
   const [opponentConnected, setOpponentConnected] = useState(true);
+
+  // ── Draw state ──────────────────────────────────────────────────────────────
+  // 0 = no offer, non-zero = userId who offered
+  const [drawOfferedBy, setDrawOfferedBy]               = useState(0);
+  // move number when last decline happened — drives cooldown display
+  const [drawDeclinedMoveNumber, setDrawDeclinedMoveNumber] = useState(0);
+  const [drawSubmitting, setDrawSubmitting]             = useState(false);
+
+  // ── Rematch state ───────────────────────────────────────────────────────────
+  // 0 = no offer, non-zero = userId who offered
+  const [rematchOfferedBy, setRematchOfferedBy]         = useState(0);
+  const [rematchOfferedAt, setRematchOfferedAt]         = useState(0);
+  const [rematchExpired, setRematchExpired]             = useState(false);
+  const [rematchSubmitting, setRematchSubmitting]       = useState(false);
+  // Countdown ms remaining for the outgoing offer display
+  const [rematchCountdown, setRematchCountdown]         = useState(REMATCH_EXPIRY_MS);
+  // The game ID the rematch offer is stored on — always the finished game,
+  // never the new game. Needed because the component's gameId prop refers to
+  // the current page's game, which may differ from where the offer lives.
+  const [rematchSourceGameId, setRematchSourceGameId]   = useState(gameId);
 
   const chessRef         = useRef<DraftChess>(new DraftChess(initialFen));
   const isSubmittingMove = useRef(false);
@@ -125,12 +131,12 @@ export default function ClientGame({
   useEffect(() => { player1TimebankRef.current = player1Timebank; }, [player1Timebank]);
   useEffect(() => { player2TimebankRef.current = player2Timebank; }, [player2Timebank]);
 
-  const isPlayer1   = myUserId === player1Id;
-  const ownReady    = isPlayer1 ? readyPlayer1 : readyPlayer2;
-  const oppReady    = isPlayer1 ? readyPlayer2 : readyPlayer1;
-  const auxPoints   = isPlayer1 ? auxPointsPlayer1 : auxPointsPlayer2;
-  const myTimebank  = isPlayer1 ? player1Timebank : player2Timebank;
-  const oppTimebank = isPlayer1 ? player2Timebank : player1Timebank;
+  const isPlayer1    = myUserId === player1Id;
+  const ownReady     = isPlayer1 ? readyPlayer1 : readyPlayer2;
+  const oppReady     = isPlayer1 ? readyPlayer2 : readyPlayer1;
+  const auxPoints    = isPlayer1 ? auxPointsPlayer1 : auxPointsPlayer2;
+  const myTimebank   = isPlayer1 ? player1Timebank : player2Timebank;
+  const oppTimebank  = isPlayer1 ? player2Timebank : player1Timebank;
   const auxPointsMax = modeAuxPoints(mode);
 
   const isMyTurn = useMemo(() => {
@@ -140,6 +146,37 @@ export default function ClientGame({
       return (turn === "w" && isWhite) || (turn === "b" && !isWhite);
     } catch { return false; }
   }, [fen, status, isWhite]);
+
+  // ── Draw cooldown ───────────────────────────────────────────────────────────
+  const drawCooldownRemaining = useMemo(() => {
+    if (drawDeclinedMoveNumber === 0) return 0;
+    return Math.max(0, 3 - (moveNumber - drawDeclinedMoveNumber));
+  }, [drawDeclinedMoveNumber, moveNumber]);
+
+  const canOfferDraw = status === "active" && drawOfferedBy === 0 && drawCooldownRemaining === 0;
+  const iHaveOfferedDraw    = drawOfferedBy === myUserId;
+  const opponentOfferedDraw = drawOfferedBy !== 0 && drawOfferedBy !== myUserId;
+
+  // ── Rematch countdown ───────────────────────────────────────────────────────
+  const iHaveOfferedRematch    = rematchOfferedBy === myUserId;
+  const opponentOfferedRematch = rematchOfferedBy !== 0 && rematchOfferedBy !== myUserId;
+
+  useEffect(() => {
+    if (!iHaveOfferedRematch || rematchOfferedAt === 0) return;
+    const tick = () => {
+      const remaining = REMATCH_EXPIRY_MS - (Date.now() - rematchOfferedAt);
+      if (remaining <= 0) {
+        setRematchCountdown(0);
+        setRematchExpired(true);
+        setRematchOfferedBy(0);
+      } else {
+        setRematchCountdown(remaining);
+      }
+    };
+    tick();
+    const t = setInterval(tick, 200);
+    return () => clearInterval(t);
+  }, [iHaveOfferedRematch, rematchOfferedAt]);
 
   const pieceLibrary = useMemo(() => [
     { name: "Pawn",   value: 1, fen: "P", ui: isWhite ? "wP" : "bP", symbol: isWhite ? "♙" : "♟" },
@@ -223,44 +260,108 @@ export default function ClientGame({
         player2EloAfter: payload.player2EloAfter,
         eloChange:       payload.eloChange,
       });
+      // Clear any draw offer when game ends
+      setDrawOfferedBy(0);
     }
-  }, [updateTimerSnapshot]);
+
+    // Draw events
+    if (payload.drawOfferedBy !== undefined) {
+      setDrawOfferedBy(payload.drawOfferedBy);
+      if (payload.drawOfferedBy !== 0 && payload.drawOfferedBy !== myUserId) {
+        toast.info("Opponent offers a draw");
+      }
+    }
+    if (payload.drawDeclined) {
+      setDrawOfferedBy(0);
+      // Server will have updated drawDeclinedMoveNumber via the next move event;
+      // optimistically set it to current moveNumber so UI updates immediately.
+      setDrawDeclinedMoveNumber(moveNumber);
+      if (iHaveOfferedDraw) toast.warn("Draw offer declined");
+    }
+
+    // Rematch events
+    if (payload.rematchOfferedBy !== undefined && payload.rematchOfferedBy !== 0) {
+      setRematchOfferedBy(payload.rematchOfferedBy);
+      setRematchOfferedAt(Date.now());
+      setRematchExpired(false);
+      // Record which game this offer lives on so accept/decline POST to the
+      // correct gameId even if the component is somehow re-used across games.
+      setRematchSourceGameId(gameId);
+      if (payload.rematchOfferedBy !== myUserId) toast.info("Opponent wants a rematch");
+    }
+    if (payload.rematchDeclined) {
+      // iHaveOfferedRematch is true for the sender — show them the decline toast.
+      // The decliner already knows; they clicked the button.
+      if (rematchOfferedBy === myUserId) toast.warn("Rematch declined");
+      setRematchOfferedBy(0);
+      setRematchExpired(false);
+    }
+    if (payload.rematchCancelled) {
+      setRematchOfferedBy(0);
+      setRematchExpired(false);
+    }
+  }, [updateTimerSnapshot, myUserId, moveNumber, iHaveOfferedDraw, toast]);
+
+  // Stable refs so the socket useEffect can call the latest versions of these
+  // callbacks without them appearing in its dependency array.
+  // Without this, any state change that causes handleGameUpdate to get a new
+  // reference (e.g. moveNumber incrementing) re-runs the socket effect, which
+  // re-emits join-game, which triggers a snapshot, which increments moveNumber
+  // — an infinite loop.
+  const handleGameUpdateRef  = useRef(handleGameUpdate);
+  const updateTimerSnapshotRef = useRef(updateTimerSnapshot);
+  useEffect(() => { handleGameUpdateRef.current  = handleGameUpdate;  }, [handleGameUpdate]);
+  useEffect(() => { updateTimerSnapshotRef.current = updateTimerSnapshot; }, [updateTimerSnapshot]);
 
   // ─── WebSocket setup ───────────────────────────────────────────────────────
   useEffect(() => {
     let mounted = true;
+
     const init = async () => {
       try {
         const res = await apiFetch(`/api/game/${gameId}/status`, { method: "GET" });
         if (!res.ok) throw new Error("Failed to load game state");
         const data = await res.json();
-        if (mounted) {
-          handleGameUpdate(data);
-          if (data.prepStartedAt) setPrepStartedAt(new Date(data.prepStartedAt));
-          if (data.moveNumber !== undefined) setMoveNumber(data.moveNumber);
-          if (data.lastMoveAt) {
-            updateTimerSnapshot(new Date(data.lastMoveAt), data.player1Timebank ?? 60000, data.player2Timebank ?? 60000);
-            if (data.timeRemainingOnMove !== undefined) setMoveTimeRemaining(data.timeRemainingOnMove);
-          }
-          if (data.status === "finished" && data.endReason) {
-            setGameResult({ winnerId: data.winnerId ?? null, endReason: data.endReason, player1EloAfter: data.player1EloAfter, player2EloAfter: data.player2EloAfter, eloChange: data.eloChange });
-          }
+        if (!mounted) return;
+
+        handleGameUpdateRef.current(data);
+        if (data.prepStartedAt) setPrepStartedAt(new Date(data.prepStartedAt));
+        if (data.moveNumber !== undefined) setMoveNumber(data.moveNumber);
+        if (data.lastMoveAt) {
+          updateTimerSnapshotRef.current(new Date(data.lastMoveAt), data.player1Timebank ?? 60000, data.player2Timebank ?? 60000);
+          if (data.timeRemainingOnMove !== undefined) setMoveTimeRemaining(data.timeRemainingOnMove);
+        }
+        if (data.status === "finished" && data.endReason) {
+          setGameResult({ winnerId: data.winnerId ?? null, endReason: data.endReason, player1EloAfter: data.player1EloAfter, player2EloAfter: data.player2EloAfter, eloChange: data.eloChange });
         }
 
         const socket = await getSocket();
+        if (!mounted) return;
+
         socket.emit("join-game", gameId);
-        socket.on("game-update",           (p: any)   => { if (mounted) handleGameUpdate(p); });
+        socket.on("game-update",           (p: any)   => { if (mounted) handleGameUpdateRef.current(p); });
         socket.on("opponent-disconnected", () => { if (mounted) { setOpponentConnected(false); toast.warn("Opponent disconnected"); } });
         socket.on("opponent-connected",    () => { if (mounted) { setOpponentConnected(true);  toast.info("Opponent reconnected"); } });
         socket.on("connect_error",  (_e: Error) => { if (mounted) { setSocketError("Connection lost — reconnecting…"); toast.warn("Connection lost — moves may be delayed"); } });
-        socket.on("reconnect",      ()          => { if (mounted) { setSocketError(null); toast.info("Reconnected"); socket.emit("join-game", gameId); } });
+        socket.on("reconnect", () => {
+          if (!mounted) return;
+          setSocketError(null);
+          toast.info("Reconnected");
+          setStatus(prev => {
+            if (prev !== "finished") socket.emit("join-game", gameId);
+            return prev;
+          });
+        });
+        socket.on("rematch-accepted", (data: { gameId: number }) => {
+          if (mounted) window.location.href = `/play/game/${data.gameId}`;
+        });
         socket.on("game-snapshot", (data: any) => {
           if (!mounted) return;
-          handleGameUpdate(data);
+          handleGameUpdateRef.current(data);
           if (data.prepStartedAt) setPrepStartedAt(new Date(data.prepStartedAt));
           if (data.moveNumber !== undefined) setMoveNumber(data.moveNumber);
           if (data.lastMoveAt) {
-            updateTimerSnapshot(new Date(data.lastMoveAt), data.player1Timebank ?? 60000, data.player2Timebank ?? 60000);
+            updateTimerSnapshotRef.current(new Date(data.lastMoveAt), data.player1Timebank ?? 60000, data.player2Timebank ?? 60000);
             if (data.timeRemainingOnMove !== undefined) setMoveTimeRemaining(data.timeRemainingOnMove);
           }
           if (data.status === "finished" && data.endReason) {
@@ -277,9 +378,10 @@ export default function ClientGame({
       getSocket().then(s => {
         s.off("game-update"); s.off("game-snapshot"); s.off("connect_error");
         s.off("reconnect"); s.off("opponent-disconnected"); s.off("opponent-connected");
+        s.off("rematch-accepted");
       }).catch(() => {});
     };
-  }, [gameId, handleGameUpdate, updateTimerSnapshot]);
+  }, [gameId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ─── Prep countdown ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -291,26 +393,16 @@ export default function ClientGame({
   }, [status, prepStartedAt]);
 
   // ─── Active game timer ─────────────────────────────────────────────────────
-  // Key mapping:
-  //   FEN turn "w" → white player is active → white player's timebank drains
-  //   whitePlayerId determines who is white. We know isWhite (am I white?) and
-  //   isPlayer1 (am I player1?). So: whiteIsPlayer1 = isWhite === isPlayer1.
-  //   If FEN turn "w" → white is active → if whiteIsPlayer1 → p1Timebank drains,
-  //   else p2Timebank drains.
-  const whiteIsPlayer1 = isWhite === isPlayer1; // true if white==player1, false if white==player2
+  const whiteIsPlayer1 = isWhite === isPlayer1;
 
   useEffect(() => {
     if (status !== "active") return;
     const tick = () => {
       const snap = timerSnapshot.current;
       if (!snap) return;
-      const elapsed      = Date.now() - snap.lastMoveAt.getTime();
-      const fenTurn      = chessRef.current.turn(); // "w" or "b"
-      // Map FEN color → player slot (p1/p2)
-      // whiteIsPlayer1: "w"→p1, "b"→p2
-      // !whiteIsPlayer1: "w"→p2, "b"→p1
-      const activeIsP1   = fenTurn === "w" ? whiteIsPlayer1 : !whiteIsPlayer1;
-
+      const elapsed    = Date.now() - snap.lastMoveAt.getTime();
+      const fenTurn    = chessRef.current.turn();
+      const activeIsP1 = fenTurn === "w" ? whiteIsPlayer1 : !whiteIsPlayer1;
       setMoveTimeRemaining(Math.max(0, MOVE_TIME_LIMIT - elapsed));
       if (elapsed > MOVE_TIME_LIMIT) {
         const overage = elapsed - MOVE_TIME_LIMIT;
@@ -324,7 +416,7 @@ export default function ClientGame({
   }, [status, whiteIsPlayer1]); // eslint-disable-line
 
   // ─── FEN helpers ───────────────────────────────────────────────────────────
-  const expandRow  = (row: string) => { let r = ""; for (const c of row) r += /\d/.test(c) ? "1".repeat(+c) : c; return r; };
+  const expandRow   = (row: string) => { let r = ""; for (const c of row) r += /\d/.test(c) ? "1".repeat(+c) : c; return r; };
   const compressRow = (row: string) => { let r = "", n = 0; for (const c of row) { if (c === "1") n++; else { if (n) { r += n; n = 0; } r += c; } } if (n) r += n; return r; };
 
   const getPieceAt = (f: string, sq: string) => {
@@ -363,8 +455,8 @@ export default function ClientGame({
     for (const r of ownRanks) {
       for (let f = 0; f < 8; f++) {
         const sq = String.fromCharCode(97+f) + r;
-        if (fenLetter === "P" && r !== pawnRank)       { illegal.push(sq); continue; }
-        if (getPieceAt(fen, sq) !== "1")               { illegal.push(sq); continue; }
+        if (fenLetter === "P" && r !== pawnRank)   { illegal.push(sq); continue; }
+        if (getPieceAt(fen, sq) !== "1")           { illegal.push(sq); continue; }
         const tmp = simulatePlace(fen, isWhite ? fenLetter : fenLetter.toLowerCase(), sq);
         if (hasIllegalBattery(tmp)) illegal.push(sq); else legal.push(sq);
       }
@@ -379,7 +471,7 @@ export default function ClientGame({
     return s;
   }, [legalSquares, illegalSquares]);
 
-  // ─── Handlers ──────────────────────────────────────────────────────────────
+  // ─── Action handlers ────────────────────────────────────────────────────────
   const handlePlace = async (fenLetter: string, square: string) => {
     const sel = pieceLibrary.find(p => p.fen === fenLetter);
     if (!sel || ownReady || sel.value > auxPoints) return;
@@ -404,16 +496,12 @@ export default function ClientGame({
       .then(async res => {
         if (!res.ok) {
           const err = await res.json();
-          console.error("Move rejected:", err.error);
           toast.warn(err.error ?? "Move rejected — board refreshed");
           const sr = await apiFetch(`/api/game/${gameId}/status`, { method: "GET" });
           if (sr.ok) handleGameUpdate(await sr.json());
         }
       })
-      .catch(err => {
-        console.error("Move error:", err);
-        toast.error("Connection error — move may not have been recorded");
-      })
+      .catch(() => toast.error("Connection error — move may not have been recorded"))
       .finally(() => { isSubmittingMove.current = false; });
   }, [gameId, handleGameUpdate, toast]);
 
@@ -450,25 +538,124 @@ export default function ClientGame({
     try {
       const res = await apiFetch(`/api/game/${gameId}/resign`, { method: "POST" });
       if (!res.ok) { const err = await res.json(); toast.error(err.error ?? "Failed to resign"); }
-    } catch (err) { console.error("Resign error:", err); toast.error("Connection error — could not resign"); }
+    } catch { toast.error("Connection error — could not resign"); }
+  };
+
+  // ── Draw handlers ───────────────────────────────────────────────────────────
+  const handleDrawOffer = async () => {
+    if (drawSubmitting || !canOfferDraw) return;
+    setDrawSubmitting(true);
+    try {
+      const res = await apiFetch(`/api/game/${gameId}/draw/offer`, { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json();
+        toast.warn(err.error ?? "Could not offer draw");
+      }
+      // Optimistic update — server broadcasts drawOfferedBy via game-update
+    } catch { toast.error("Connection error — could not offer draw"); }
+    finally { setDrawSubmitting(false); }
+  };
+
+  const handleDrawCancel = async () => {
+    if (drawSubmitting) return;
+    setDrawSubmitting(true);
+    try {
+      const res = await apiFetch(`/api/game/${gameId}/draw/cancel`, { method: "POST" });
+      if (res.ok) setDrawOfferedBy(0);
+    } catch { /* non-fatal */ }
+    finally { setDrawSubmitting(false); }
+  };
+
+  const handleDrawAccept = async () => {
+    if (drawSubmitting) return;
+    setDrawSubmitting(true);
+    try {
+      const res = await apiFetch(`/api/game/${gameId}/draw/accept`, { method: "POST" });
+      if (!res.ok) { const err = await res.json(); toast.warn(err.error ?? "Could not accept draw"); }
+    } catch { toast.error("Connection error"); }
+    finally { setDrawSubmitting(false); }
+  };
+
+  const handleDrawDecline = async () => {
+    if (drawSubmitting) return;
+    setDrawSubmitting(true);
+    try {
+      const res = await apiFetch(`/api/game/${gameId}/draw/decline`, { method: "POST" });
+      if (res.ok) setDrawOfferedBy(0);
+    } catch { /* non-fatal */ }
+    finally { setDrawSubmitting(false); }
+  };
+
+  // ── Rematch handlers ─────────────────────────────────────────────────────────
+  const handleRematchOffer = async () => {
+    if (rematchSubmitting) return;
+    setRematchSubmitting(true);
+    try {
+      const res = await apiFetch(`/api/game/${gameId}/rematch/offer`, { method: "POST" });
+      if (res.ok) {
+        setRematchOfferedBy(myUserId);
+        setRematchOfferedAt(Date.now());
+        setRematchExpired(false);
+        setRematchSourceGameId(gameId);
+      } else {
+        const err = await res.json();
+        toast.warn(err.error ?? "Could not offer rematch");
+      }
+    } catch { toast.error("Connection error"); }
+    finally { setRematchSubmitting(false); }
+  };
+
+  const handleRematchAccept = async () => {
+    if (rematchSubmitting) return;
+    setRematchSubmitting(true);
+    try {
+      // Use rematchSourceGameId — the offer lives on the finished game,
+      // not necessarily the current gameId prop.
+      const res = await apiFetch(`/api/game/${rematchSourceGameId}/rematch/accept`, { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json();
+        toast.warn(err.error ?? "Could not accept rematch");
+        setRematchSubmitting(false);
+      }
+      // On success the server emits rematch-accepted which triggers navigation
+    } catch {
+      toast.error("Connection error");
+      setRematchSubmitting(false);
+    }
+  };
+
+  const handleRematchDecline = async () => {
+    if (rematchSubmitting) return;
+    setRematchSubmitting(true);
+    // Clear local state immediately — don't wait for server response.
+    // If the offer is already gone (expired, race) the server returns 409
+    // but the UI should still reset to the idle state.
+    setRematchOfferedBy(0);
+    try {
+      await apiFetch(`/api/game/${rematchSourceGameId}/rematch/decline`, { method: "POST" });
+    } catch { /* non-fatal */ }
+    finally { setRematchSubmitting(false); }
   };
 
   // ─── Derived display ───────────────────────────────────────────────────────
   const prepPct           = (prepTimeRemaining / 60) * 100;
   const isLowPrep         = prepTimeRemaining <= 15;
-  // Timebank kicks in for the active turn-holder once the 30s move clock hits 0
   const myTimebankActive  = isMyTurn  && moveTimeRemaining === 0;
   const oppTimebankActive = !isMyTurn && moveTimeRemaining === 0;
-  // What the large center display shows: my time when my turn, opp time when their turn
   const largeDisplayMs    = isMyTurn
     ? (myTimebankActive  ? myTimebank  : moveTimeRemaining)
     : (oppTimebankActive ? oppTimebank : moveTimeRemaining);
-  const largeDisplayIsBank = isMyTurn ? myTimebankActive : oppTimebankActive;
 
   const endReasonLabels: Record<string, string> = {
-    checkmate: "Checkmate", stalemate: "Stalemate", repetition: "Threefold Repetition",
-    insufficient_material: "Insufficient Material", draw: "Draw by Agreement",
-    timeout: "Time Out", resignation: "Resignation", abandoned: "Abandoned",
+    checkmate:             "Checkmate",
+    stalemate:             "Stalemate",
+    repetition:            "Threefold Repetition",
+    insufficient_material: "Insufficient Material",
+    draw:                  "Draw",
+    draw_agreement:        "Draw by Agreement",
+    timeout:               "Time Out",
+    resignation:           "Resignation",
+    abandoned:             "Abandoned",
   };
 
   // ─── PREP PHASE ────────────────────────────────────────────────────────────
@@ -483,55 +670,32 @@ export default function ClientGame({
         `}</style>
 
         <div className="flex min-h-[calc(100vh-56px)] bg-[#0f1117]">
-
-          {/* ── Left Panel ─────────────────────────────────────────────────── */}
           <aside className="w-72 flex-shrink-0 bg-[#1a1d2e] border-r border-white/8 flex flex-col">
-
-            {/* Header */}
             <div className="px-6 pt-6 pb-5 border-b border-white/6">
               <div className="flex items-center gap-2 mb-1">
                 <div className="w-2 h-2 rounded-full bg-amber-400 pulse-gold" />
                 <span className="text-xs font-bold uppercase tracking-widest text-amber-400">Prep Phase</span>
               </div>
-              <p className="text-white/45 text-xs leading-relaxed">
-                Place your extra pieces. Opponent can't see them yet.
-              </p>
+              <p className="text-white/45 text-xs leading-relaxed">Place your extra pieces. Opponent can't see them yet.</p>
             </div>
-
-            {/* Prep timer */}
             <div className="px-6 py-4 border-b border-white/6">
               <div className="flex items-baseline justify-between mb-2">
                 <span className="text-xs text-white/35 uppercase tracking-wider">Time left</span>
-                <span className={`font-display text-2xl font-700 tabular-nums ${isLowPrep ? "text-red-400" : "text-white"}`}>
-                  {Math.ceil(prepTimeRemaining)}s
-                </span>
+                <span className={`font-display text-2xl font-700 tabular-nums ${isLowPrep ? "text-red-400" : "text-white"}`}>{Math.ceil(prepTimeRemaining)}s</span>
               </div>
               <div className="h-1 rounded-full bg-white/8 overflow-hidden">
-                <div
-                  className={`h-full rounded-full transition-all duration-200 ${isLowPrep ? "bg-red-500" : "bg-amber-400"}`}
-                  style={{ width: `${prepPct}%` }}
-                />
+                <div className={`h-full rounded-full transition-all duration-200 ${isLowPrep ? "bg-red-500" : "bg-amber-400"}`} style={{ width: `${prepPct}%` }} />
               </div>
             </div>
-
-            {/* Points remaining */}
             <div className="px-6 py-4 border-b border-white/6">
               <div className="flex items-baseline justify-between mb-2">
                 <span className="text-xs text-white/35 uppercase tracking-wider">Points</span>
-                <span className="font-display text-2xl font-700 tabular-nums text-white">
-                  {auxPoints}
-                  <span className="text-xs font-400 text-white/30 ml-1">/ {auxPointsMax}</span>
-                </span>
+                <span className="font-display text-2xl font-700 tabular-nums text-white">{auxPoints}<span className="text-xs font-400 text-white/30 ml-1">/ {auxPointsMax}</span></span>
               </div>
               <div className="h-1 rounded-full bg-white/8 overflow-hidden">
-                <div
-                  className="h-full rounded-full bg-amber-400/70 transition-all duration-300"
-                  style={{ width: `${(auxPoints / auxPointsMax) * 100}%` }}
-                />
+                <div className="h-full rounded-full bg-amber-400/70 transition-all duration-300" style={{ width: `${(auxPoints / auxPointsMax) * 100}%` }} />
               </div>
             </div>
-
-            {/* Piece selector */}
             <div className="flex-1 px-6 py-4">
               <p className="text-[10px] font-bold uppercase tracking-widest text-white/30 mb-3">Place a piece</p>
               <div className="space-y-2">
@@ -539,107 +703,54 @@ export default function ClientGame({
                   const canAfford = auxPoints >= p.value;
                   const isActive  = activePiece === p.ui;
                   return (
-                    <button
-                      key={p.ui}
-                      disabled={(!canAfford && !isActive) || ownReady}
+                    <button key={p.ui} disabled={(!canAfford && !isActive) || ownReady}
                       onClick={() => {
                         if (isActive) { setActivePiece(null); setLegalSquares([]); setIllegalSquares([]); }
                         else { setActivePiece(p.ui); const { legal, illegal } = calculatePlacementSquares(p.fen); setLegalSquares(legal); setIllegalSquares(illegal); }
                       }}
-                      className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border text-sm transition-all duration-150
-                        ${isActive
-                          ? "bg-amber-500/15 border-amber-500/50 text-amber-400 shadow-[0_0_12px_rgba(245,158,11,0.15)]"
-                          : canAfford && !ownReady
-                            ? "border-white/8 bg-white/[0.02] text-white/70 hover:bg-white/[0.06] hover:text-white hover:border-white/18 cursor-pointer"
-                            : "border-white/5 bg-transparent text-white/20 cursor-not-allowed"
-                        }`}
-                    >
+                      className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl border text-sm transition-all duration-150 ${isActive ? "bg-amber-500/15 border-amber-500/50 text-amber-400 shadow-[0_0_12px_rgba(245,158,11,0.15)]" : canAfford && !ownReady ? "border-white/8 bg-white/[0.02] text-white/70 hover:bg-white/[0.06] hover:text-white hover:border-white/18 cursor-pointer" : "border-white/5 bg-transparent text-white/20 cursor-not-allowed"}`}>
                       <span className="text-2xl leading-none w-7 text-center">{p.symbol}</span>
                       <span className="flex-1 font-display font-600">{p.name}</span>
-                      <span className={`text-xs tabular-nums px-1.5 py-0.5 rounded-md ${isActive ? "bg-amber-500/20 text-amber-400" : "bg-white/6 text-white/30"}`}>
-                        {p.value}pt
-                      </span>
+                      <span className={`text-xs tabular-nums px-1.5 py-0.5 rounded-md ${isActive ? "bg-amber-500/20 text-amber-400" : "bg-white/6 text-white/30"}`}>{p.value}pt</span>
                     </button>
                   );
                 })}
               </div>
-              {activePiece && (
-                <p className="text-[11px] text-amber-400/60 mt-3 text-center">
-                  ↓ Click a highlighted square
-                </p>
-              )}
+              {activePiece && <p className="text-[11px] text-amber-400/60 mt-3 text-center">↓ Click a highlighted square</p>}
             </div>
-
-            {/* Opponent status */}
             <div className="px-6 py-3 border-t border-white/6">
               <div className="flex items-center gap-2">
                 <div className={`w-2 h-2 rounded-full ${oppReady ? "bg-emerald-400" : "bg-white/20"}`} />
-                <span className="text-xs text-white/40">
-                  {oppReady ? "Opponent is ready" : "Opponent is placing pieces..."}
-                </span>
+                <span className="text-xs text-white/40">{oppReady ? "Opponent is ready" : "Opponent is placing pieces..."}</span>
               </div>
             </div>
-
-            {/* Ready button */}
             <div className="px-6 pb-6">
-              <button
-                onClick={handleReady}
-                disabled={ownReady}
-                className={`w-full py-3.5 rounded-xl font-display font-600 text-sm transition-all duration-200
-                  ${ownReady
-                    ? "bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 cursor-default"
-                    : "bg-amber-400 hover:bg-amber-300 text-[#0f1117] active:scale-[0.98] shadow-lg shadow-amber-500/20"
-                  }`}
-              >
+              <button onClick={handleReady} disabled={ownReady}
+                className={`w-full py-3.5 rounded-xl font-display font-600 text-sm transition-all duration-200 ${ownReady ? "bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 cursor-default" : "bg-amber-400 hover:bg-amber-300 text-[#0f1117] active:scale-[0.98] shadow-lg shadow-amber-500/20"}`}>
                 {ownReady ? "✓ Ready — waiting for opponent" : "Lock in & Ready"}
               </button>
             </div>
           </aside>
 
-          {/* ── Board area ───────────────────────────────────────────────── */}
           <main className="flex-1 flex flex-col items-center justify-center p-8 gap-5">
             {socketError && (
-              <div className="w-full max-w-[600px] px-4 py-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-sm text-center">
-                ⚠ {socketError}
-              </div>
+              <div className="w-full max-w-[600px] px-4 py-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-sm text-center">⚠ {socketError}</div>
             )}
-
             <div className="text-center slide-in">
-              <h1 className="font-display text-xl font-700 text-white/80 mb-0.5">
-                Game <span className="text-amber-400">#{gameId}</span>
-              </h1>
-              <p className="text-xs text-white/30">
-                Playing as <span className="text-white/60">{isWhite ? "White ♔" : "Black ♚"}</span>
-              </p>
+              <h1 className="font-display text-xl font-700 text-white/80 mb-0.5">Game <span className="text-amber-400">#{gameId}</span></h1>
+              <p className="text-xs text-white/30">Playing as <span className="text-white/60">{isWhite ? "White ♔" : "Black ♚"}</span></p>
             </div>
-
             <div className="w-full max-w-[600px] rounded-2xl overflow-hidden border border-white/10 shadow-[0_0_60px_rgba(0,0,0,0.6)] slide-in">
-              <Chessboard
-                options={{
-                  position: fen,
-                  boardOrientation: isWhite ? "white" : "black",
-                  onPieceDrag: () => {},
-                  onPieceDrop: () => false,
-                  onSquareClick: ({ square }) => {
-                    if (!activePiece || ownReady) return;
-                    const s = pieceLibrary.find(p => p.ui === activePiece);
-                    if (s) handlePlace(s.fen, square);
-                  },
-                  squareStyles: customSquareStyles,
-                }}
-              />
+              <Chessboard options={{ position: fen, boardOrientation: isWhite ? "white" : "black", onPieceDrag: () => {}, onPieceDrop: () => false, onSquareClick: ({ square }) => { if (!activePiece || ownReady) return; const s = pieceLibrary.find(p => p.ui === activePiece); if (s) handlePlace(s.fen, square); }, squareStyles: customSquareStyles }} />
             </div>
-
-            <p className="text-xs text-white/20 text-center max-w-sm">
-              Your placements are hidden from your opponent until the game starts
-            </p>
+            <p className="text-xs text-white/20 text-center max-w-sm">Your placements are hidden from your opponent until the game starts</p>
           </main>
         </div>
       </>
     );
   }
 
-  // ─── ACTIVE / FINISHED ────────────────────────────────────────────────────
+  // ─── ACTIVE / FINISHED ─────────────────────────────────────────────────────
   return (
     <>
       <style>{`
@@ -648,11 +759,13 @@ export default function ClientGame({
         @keyframes scaleIn    { from { opacity:0; transform:scale(0.95); } to { opacity:1; transform:scale(1); } }
         @keyframes flashBonus { 0%{opacity:0;transform:translateY(-4px)} 15%{opacity:1;transform:translateY(0)} 80%{opacity:1} 100%{opacity:0;transform:translateY(-8px)} }
         @keyframes timerPulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
-        .slide-in { animation: slideIn 0.3s ease both; }
-        .fade-in  { animation: fadeIn 0.4s ease both; }
-        .scale-in { animation: scaleIn 0.35s ease both; }
+        @keyframes drawPulse  { 0%,100%{opacity:1} 50%{opacity:0.6} }
+        .slide-in    { animation: slideIn 0.3s ease both; }
+        .fade-in     { animation: fadeIn 0.4s ease both; }
+        .scale-in    { animation: scaleIn 0.35s ease both; }
         .bonus-flash { animation: flashBonus 4s ease both; }
         .timer-urgent { animation: timerPulse 0.8s ease-in-out infinite; }
+        .draw-pulse   { animation: drawPulse 2s ease-in-out infinite; }
       `}</style>
 
       {/* ── Game Result Overlay ──────────────────────────────────────────── */}
@@ -665,37 +778,79 @@ export default function ClientGame({
 
             return (
               <div className="bg-[#1a1d2e] border border-white/12 rounded-3xl p-10 shadow-2xl text-center max-w-sm w-full mx-6 scale-in">
-                {/* Result icon */}
-                <div className={`w-20 h-20 mx-auto rounded-2xl flex items-center justify-center text-5xl mb-6 ${
-                  isDraw ? "bg-amber-500/15 border border-amber-500/30" :
-                  isWinner ? "bg-emerald-500/15 border border-emerald-500/30" :
-                  "bg-red-500/10 border border-red-500/20"
-                }`}>
+                <div className={`w-20 h-20 mx-auto rounded-2xl flex items-center justify-center text-5xl mb-6 ${isDraw ? "bg-amber-500/15 border border-amber-500/30" : isWinner ? "bg-emerald-500/15 border border-emerald-500/30" : "bg-red-500/10 border border-red-500/20"}`}>
                   {isDraw ? "=" : isWinner ? "♔" : "♚"}
                 </div>
 
-                <h2 className={`font-display text-4xl font-800 mb-1 ${
-                  isDraw ? "text-amber-400" : isWinner ? "text-emerald-400" : "text-white/70"
-                }`}>
+                <h2 className={`font-display text-4xl font-800 mb-1 ${isDraw ? "text-amber-400" : isWinner ? "text-emerald-400" : "text-white/70"}`}>
                   {isDraw ? "Draw" : isWinner ? "Victory" : "Defeat"}
                 </h2>
-                <p className="text-white/40 text-sm mb-7">
-                  {endReasonLabels[gameResult.endReason] ?? gameResult.endReason}
-                </p>
+                <p className="text-white/40 text-sm mb-7">{endReasonLabels[gameResult.endReason] ?? gameResult.endReason}</p>
 
                 {myElo !== undefined && gameResult.eloChange !== undefined && (
                   <div className="flex items-center justify-center gap-3 mb-7 px-5 py-3 rounded-xl bg-white/[0.04] border border-white/8">
                     <span className="text-white/50 text-sm">Rating</span>
                     <span className="font-display font-700 text-white text-lg">{myElo}</span>
-                    <span className={`text-sm font-600 px-2 py-0.5 rounded-full ${
-                      isWinner ? "bg-emerald-500/15 text-emerald-400" :
-                      isDraw   ? "bg-white/8 text-white/50" :
-                      "bg-red-500/10 text-red-400"
-                    }`}>
+                    <span className={`text-sm font-600 px-2 py-0.5 rounded-full ${isWinner ? "bg-emerald-500/15 text-emerald-400" : isDraw ? "bg-white/8 text-white/50" : "bg-red-500/10 text-red-400"}`}>
                       {isWinner ? "+" : isDraw ? "±" : "−"}{gameResult.eloChange}
                     </span>
                   </div>
                 )}
+
+                {/* ── Rematch section ──────────────────────────────────────── */}
+                <div className="mb-5">
+                  {/* Neither player has offered yet */}
+                  {rematchOfferedBy === 0 && !rematchExpired && (
+                    <button
+                      onClick={handleRematchOffer}
+                      disabled={rematchSubmitting}
+                      className="w-full py-3 rounded-xl bg-white/[0.05] border border-white/10 hover:border-amber-500/30 hover:bg-amber-500/8 text-white/60 hover:text-amber-400 font-display font-600 text-sm transition-all duration-200 disabled:opacity-40"
+                    >
+                      {rematchSubmitting ? "Sending…" : "Rematch"}
+                    </button>
+                  )}
+
+                  {/* I offered — waiting with countdown */}
+                  {iHaveOfferedRematch && !rematchExpired && (
+                    <div className="rounded-xl border border-white/8 bg-white/[0.03] px-4 py-3 flex items-center justify-between gap-3">
+                      <div className="flex items-center gap-2.5">
+                        <div className="w-1.5 h-1.5 rounded-full bg-amber-400 draw-pulse" />
+                        <span className="text-xs text-white/50">Waiting for opponent</span>
+                      </div>
+                      <span className="font-display font-700 text-sm tabular-nums text-amber-400">
+                        {Math.ceil(rematchCountdown / 1000)}s
+                      </span>
+                    </div>
+                  )}
+
+                  {/* Opponent offered — accept or decline */}
+                  {opponentOfferedRematch && !rematchExpired && (
+                    <div className="rounded-xl border border-amber-500/25 bg-amber-500/6 px-4 py-3">
+                      <p className="text-xs text-amber-400/80 mb-3 text-center">Opponent wants a rematch</p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleRematchAccept}
+                          disabled={rematchSubmitting}
+                          className="flex-1 py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-[#0f1117] font-display font-700 text-sm transition-colors disabled:opacity-50"
+                        >
+                          {rematchSubmitting ? "…" : "Accept"}
+                        </button>
+                        <button
+                          onClick={handleRematchDecline}
+                          disabled={rematchSubmitting}
+                          className="flex-1 py-2.5 rounded-lg border border-white/10 hover:border-white/20 text-white/40 hover:text-white/60 font-display font-600 text-sm transition-all disabled:opacity-50"
+                        >
+                          Decline
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Offer expired */}
+                  {rematchExpired && rematchOfferedBy === 0 && (
+                    <p className="text-xs text-white/25 text-center py-1">Rematch offer expired</p>
+                  )}
+                </div>
 
                 <div className="flex gap-3 justify-center">
                   <a href="/play/select" className="flex-1 py-3 bg-amber-400 hover:bg-amber-300 text-[#0f1117] font-display font-700 text-sm rounded-xl transition-colors text-center">
@@ -720,6 +875,31 @@ export default function ClientGame({
         </div>
       )}
 
+      {/* ── Draw offer banner — floats above board when active ──────────── */}
+      {opponentOfferedDraw && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-40 w-full max-w-sm mx-auto px-4">
+          <div className="rounded-2xl border border-white/12 bg-[#1a1d2e]/95 backdrop-blur-sm px-5 py-4 shadow-2xl scale-in">
+            <p className="text-xs text-white/45 uppercase tracking-wider mb-3 text-center">Opponent offers a draw</p>
+            <div className="flex gap-2">
+              <button
+                onClick={handleDrawAccept}
+                disabled={drawSubmitting}
+                className="flex-1 py-2.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 hover:border-white/20 text-white/70 hover:text-white font-display font-600 text-sm transition-all disabled:opacity-40"
+              >
+                {drawSubmitting ? "…" : "Accept draw"}
+              </button>
+              <button
+                onClick={handleDrawDecline}
+                disabled={drawSubmitting}
+                className="flex-1 py-2.5 rounded-xl border border-white/8 text-white/35 hover:text-white/55 hover:border-white/15 font-display font-600 text-sm transition-all disabled:opacity-40"
+              >
+                Decline
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ── Main layout ──────────────────────────────────────────────────── */}
       <div className="min-h-[calc(100vh-56px)] bg-[#0f1117] flex items-center justify-center px-4 py-6">
         <div className="w-full max-w-[1000px] flex flex-col lg:flex-row gap-6 items-center lg:items-start">
@@ -727,28 +907,19 @@ export default function ClientGame({
           {/* ── Board column ───────────────────────────────────────────── */}
           <div className="flex flex-col items-center gap-3 flex-1 min-w-0 w-full max-w-[600px]">
 
-            {/* Opponent row (top of board — F-pattern secondary) */}
+            {/* Opponent row */}
             <div className="w-full flex items-center justify-between gap-3 px-1 slide-in">
-              {/* Opponent identity */}
               <div className="flex items-center gap-2.5">
                 <div className={`w-2 h-2 rounded-full flex-shrink-0 ${opponentConnected ? "bg-emerald-400" : "bg-red-400"}`} />
-                <div className="w-8 h-8 rounded-lg bg-white/8 border border-white/10 flex items-center justify-center text-lg">
-                  {isWhite ? "♚" : "♔"}
-                </div>
+                <div className="w-8 h-8 rounded-lg bg-white/8 border border-white/10 flex items-center justify-center text-lg">{isWhite ? "♚" : "♔"}</div>
                 <div>
                   <p className="text-sm font-display font-600 text-white/80 leading-none">Opponent</p>
                   {!opponentConnected && <p className="text-[10px] text-red-400 mt-0.5">Reconnecting…</p>}
                 </div>
               </div>
-
-              {/* Opponent timebank */}
               <div className="flex items-center gap-2">
                 <span className="text-[10px] text-white/25 uppercase tracking-wider">Bank</span>
-                <span className={`font-display font-700 text-base tabular-nums transition-colors ${
-                  oppTimebankActive
-                    ? oppTimebank < 10000 ? "text-red-400" : oppTimebank < 20000 ? "text-orange-400" : "text-amber-400"
-                    : "text-white/60"
-                }`}>
+                <span className={`font-display font-700 text-base tabular-nums transition-colors ${oppTimebankActive ? oppTimebank < 10000 ? "text-red-400" : oppTimebank < 20000 ? "text-orange-400" : "text-amber-400" : "text-white/60"}`}>
                   {formatTime(oppTimebank)}
                 </span>
               </div>
@@ -756,16 +927,8 @@ export default function ClientGame({
 
             {/* Board */}
             <div className="relative w-full rounded-2xl overflow-hidden border border-white/10 shadow-[0_0_80px_rgba(0,0,0,0.7)] slide-in">
-              <Chessboard
-                options={{
-                  position: fen,
-                  onPieceDrop: handlePieceDrop,
-                  boardOrientation: isWhite ? "white" : "black",
-                  squareStyles: customSquareStyles,
-                }}
-              />
+              <Chessboard options={{ position: fen, onPieceDrop: handlePieceDrop, boardOrientation: isWhite ? "white" : "black", squareStyles: customSquareStyles }} />
 
-              {/* Promotion overlay */}
               {pendingPromotion && (
                 <div className="absolute inset-0 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center rounded-2xl z-10">
                   <div className="bg-[#1a1d2e] border border-white/12 rounded-2xl p-6 text-center scale-in">
@@ -781,28 +944,21 @@ export default function ClientGame({
                       ))}
                     </div>
                     <button onClick={() => { setPendingPromotion(null); setFen(chessRef.current.fen()); }}
-                      className="mt-4 text-xs text-white/25 hover:text-white/50 transition-colors">
-                      Cancel
-                    </button>
+                      className="mt-4 text-xs text-white/25 hover:text-white/50 transition-colors">Cancel</button>
                   </div>
                 </div>
               )}
             </div>
 
-            {/* My row (bottom of board — primary player = lowest visual position) */}
+            {/* My row */}
             <div className="w-full flex items-center justify-between gap-3 px-1 slide-in">
-              {/* My identity */}
               <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center text-lg">
-                  {isWhite ? "♔" : "♚"}
-                </div>
+                <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center text-lg">{isWhite ? "♔" : "♚"}</div>
                 <div>
                   <p className="text-sm font-display font-600 text-white leading-none">You</p>
                   <p className="text-[10px] text-white/30 mt-0.5">{isWhite ? "White" : "Black"}</p>
                 </div>
               </div>
-
-              {/* My timebank */}
               <div className="flex items-center gap-2">
                 <span className="text-[10px] text-white/25 uppercase tracking-wider">Bank</span>
                 <span className={`font-display font-700 text-base tabular-nums ${myTimebank < 15000 ? "text-red-400" : myTimebank < 30000 ? "text-orange-400" : "text-white/70"}`}>
@@ -810,20 +966,17 @@ export default function ClientGame({
                 </span>
               </div>
             </div>
-
           </div>
 
           {/* ── Right sidebar ───────────────────────────────────────────── */}
           <aside className="flex flex-col gap-4 w-full lg:w-56 flex-shrink-0 slide-in">
 
-            {/* Move timer — primary attention anchor */}
+            {/* Move timer */}
             <div className="rounded-2xl border border-white/8 bg-[#1a1d2e] p-5">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-[10px] font-bold uppercase tracking-widest text-white/30">
                   {status === "active"
-                    ? isMyTurn
-                      ? myTimebankActive  ? "Your timebank" : "Your move"
-                      : oppTimebankActive ? "Their timebank" : "Their move"
+                    ? isMyTurn ? myTimebankActive ? "Your timebank" : "Your move" : oppTimebankActive ? "Their timebank" : "Their move"
                     : "Game over"}
                 </span>
                 <span className="text-[10px] text-white/25 tabular-nums">#{moveNumber}</span>
@@ -831,24 +984,14 @@ export default function ClientGame({
 
               {status === "active" && (
                 <>
-                  <div className={`font-display text-5xl font-800 tabular-nums leading-none mb-3 ${
-                    getTimerClass(largeDisplayMs, true)
-                  } ${largeDisplayMs < 8000 ? "timer-urgent" : ""}`}>
+                  <div className={`font-display text-5xl font-800 tabular-nums leading-none mb-3 ${getTimerClass(largeDisplayMs, true)} ${largeDisplayMs < 8000 ? "timer-urgent" : ""}`}>
                     {formatTime(largeDisplayMs)}
                   </div>
-
-                  {/* Move progress bar — drains for whoever is active */}
                   <div className="h-1 rounded-full bg-white/6 overflow-hidden mb-2">
-                    <div
-                      className={`h-full rounded-full transition-all duration-100 ${getTimerBarClass(moveTimeRemaining)}`}
-                      style={{ width: `${getTimerBarWidth(moveTimeRemaining)}%` }}
-                    />
+                    <div className={`h-full rounded-full transition-all duration-100 ${getTimerBarClass(moveTimeRemaining)}`} style={{ width: `${getTimerBarWidth(moveTimeRemaining)}%` }} />
                   </div>
-
                   <p className="text-[10px] text-white/25">
-                    {isMyTurn
-                      ? myTimebankActive  ? "Your timebank draining"  : "Your move timer"
-                      : oppTimebankActive ? "Their timebank draining" : "Their move timer"}
+                    {isMyTurn ? myTimebankActive ? "Your timebank draining" : "Your move timer" : oppTimebankActive ? "Their timebank draining" : "Their move timer"}
                   </p>
                 </>
               )}
@@ -885,6 +1028,43 @@ export default function ClientGame({
               </div>
             </div>
 
+            {/* ── Draw offer controls — active game only ──────────────── */}
+            {status === "active" && !gameResult && (
+              <div className="rounded-2xl border border-white/8 bg-[#1a1d2e] p-4 flex flex-col gap-2">
+
+                {/* No offer pending — show offer button if not on cooldown */}
+                {drawOfferedBy === 0 && (
+                  <button
+                    onClick={handleDrawOffer}
+                    disabled={drawSubmitting || !canOfferDraw}
+                    title={drawCooldownRemaining > 0 ? `${drawCooldownRemaining} move${drawCooldownRemaining !== 1 ? "s" : ""} until you can offer again` : "Offer a draw"}
+                    className="w-full py-2.5 rounded-xl border border-white/8 text-white/40 hover:text-white/65 hover:border-white/18 hover:bg-white/[0.04] font-display font-600 text-sm transition-all duration-150 disabled:opacity-30 disabled:cursor-not-allowed"
+                  >
+                    {drawCooldownRemaining > 0
+                      ? `Draw (${drawCooldownRemaining} move${drawCooldownRemaining !== 1 ? "s" : ""})`
+                      : "Offer draw"}
+                  </button>
+                )}
+
+                {/* I offered — show withdraw */}
+                {iHaveOfferedDraw && (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center gap-2 px-1">
+                      <div className="w-1.5 h-1.5 rounded-full bg-white/30 draw-pulse flex-shrink-0" />
+                      <span className="text-[11px] text-white/35">Draw offer sent</span>
+                    </div>
+                    <button
+                      onClick={handleDrawCancel}
+                      disabled={drawSubmitting}
+                      className="w-full py-2 rounded-xl border border-white/8 text-white/30 hover:text-white/50 hover:border-white/14 font-display font-600 text-xs transition-all disabled:opacity-30"
+                    >
+                      Withdraw
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Resign */}
             {status === "active" && !gameResult && (
               <button onClick={handleResign}
@@ -892,7 +1072,6 @@ export default function ClientGame({
                 Resign
               </button>
             )}
-
           </aside>
         </div>
       </div>

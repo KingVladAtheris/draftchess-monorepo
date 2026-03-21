@@ -1,6 +1,16 @@
 // apps/socket-server/src/handlers/disconnect.ts
+//
+// CHANGE: On disconnect from a finished game, cancel any pending rematch
+// offer. "Offer expires immediately on navigation" is implemented here —
+// when the socket disconnects from the game room, the offer is cleared
+// and the opponent is notified so they don't wait for a 30s expiry.
+
 import { prisma }                   from '@draftchess/db'
 import { setDisconnectedPresence }  from '../presence.js'
+import {
+  getGameState,
+  cancelRematch,
+} from '@draftchess/game-state'
 import type { Server, Socket }      from 'socket.io'
 import type {
   ClientToServerEvents,
@@ -19,7 +29,6 @@ export function registerDisconnect(io: IO, socket: Sock, redis: any): void {
     const { userId } = socket.data
     console.log(`[disconnect] user ${userId} disconnected — reason: ${reason}`)
 
-    // Remove online presence immediately
     redis.del(`online:${userId}`).catch(() => {})
 
     try {
@@ -30,8 +39,6 @@ export function registerDisconnect(io: IO, socket: Sock, redis: any): void {
 
       if (!user) return
 
-      // If the user was in the matchmaking queue, remove them cleanly.
-      // No grace period needed — they weren't in a game.
       if (user.queueStatus === 'queued') {
         await prisma.user.update({
           where: { id: userId },
@@ -45,15 +52,19 @@ export function registerDisconnect(io: IO, socket: Sock, redis: any): void {
         return
       }
 
-      // Not in a game — nothing else to do
-      if (user.queueStatus !== 'in_game') return
+      if (user.queueStatus !== 'in_game') {
+        // User may be on a finished game page with a pending rematch offer.
+        // Check their known gameId for a rematch offer to cancel.
+        const knownGameId = socket.data.gameId
+        if (knownGameId) {
+          await maybeCancelRematch(io, redis, userId, knownGameId)
+        }
+        return
+      }
 
-      // Try the gameId we stored on the socket first (fastest path)
       const knownGameId = socket.data.gameId
 
       if (!knownGameId) {
-        // Fallback: look up the active game from the DB.
-        // This happens if the client connected but never emitted join-game.
         const game = await prisma.game.findFirst({
           where: {
             status: { in: ['active', 'prep'] },
@@ -78,17 +89,53 @@ export function registerDisconnect(io: IO, socket: Sock, redis: any): void {
         select: { id: true, status: true, player1Id: true, player2Id: true },
       })
 
-      if (!game || (game.status !== 'active' && game.status !== 'prep')) return
+      if (!game) return
 
-      const opponentId = game.player1Id === userId ? game.player2Id : game.player1Id
-      await setDisconnectedPresence(redis, userId, knownGameId)
-      io.to(`game-${knownGameId}-user-${opponentId}`).emit('opponent-disconnected', {
-        userId,
-        gracePeriodSecs: DISCONNECT_GRACE_SECS,
-      })
+      if (game.status === 'active' || game.status === 'prep') {
+        const opponentId = game.player1Id === userId ? game.player2Id : game.player1Id
+        await setDisconnectedPresence(redis, userId, knownGameId)
+        io.to(`game-${knownGameId}-user-${opponentId}`).emit('opponent-disconnected', {
+          userId,
+          gracePeriodSecs: DISCONNECT_GRACE_SECS,
+        })
+        return
+      }
+
+      // Game is finished — check for pending rematch offer to cancel
+      if (game.status === 'finished') {
+        await maybeCancelRematch(io, redis, userId, knownGameId)
+      }
 
     } catch (err) {
       console.error(`[disconnect] error for user ${userId}`, err)
     }
   })
+}
+
+/**
+ * If the disconnecting user has a pending rematch offer on this game,
+ * cancel it and notify the opponent so they don't wait 30 seconds.
+ */
+async function maybeCancelRematch(
+  io:     IO,
+  redis:  any,
+  userId: number,
+  gameId: number,
+): Promise<void> {
+  try {
+    const state = await getGameState(redis, gameId)
+    if (!state || state.rematchRequestedBy !== userId) return
+
+    await cancelRematch(redis, gameId)
+
+    // Notify opponent
+    const opponentId = state.player1Id === userId ? state.player2Id : state.player1Id
+    io.to(`game-${gameId}-user-${opponentId}`).emit('game-update' as any, {
+      rematchCancelled: true,
+    })
+
+    console.log(`[disconnect] cancelled rematch offer for gameId=${gameId} userId=${userId}`)
+  } catch (err) {
+    console.error(`[disconnect] failed to cancel rematch for gameId=${gameId}`, err)
+  }
 }

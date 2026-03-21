@@ -1,8 +1,11 @@
 // apps/socket-server/src/handlers/game.ts
 //
-// Handles join-game events from clients.
-// Snapshot is read from Redis (fast path) with Postgres fallback for
-// finished games via loadGameState. FEN masking applied server-side.
+// FIX: loadGameState was called 3 times per join-game on finished games:
+//   1. Initial load for participant check
+//   2. sendSnapshot calling loadGameState again
+//   3. sendFinishedSnapshot hitting Postgres
+// Now the state is loaded once and threaded through to sendSnapshot,
+// eliminating the repeated Postgres fallback calls on finished games.
 
 import { prisma }                                            from '@draftchess/db'
 import { loadGameState }                                     from '@draftchess/game-state'
@@ -31,23 +34,21 @@ export function registerGameHandlers(io: IO, socket: Sock, redis: any): void {
     if (!gameId || typeof gameId !== 'number') return
 
     try {
-      // ── Load state from Redis ─────────────────────────────────────────
+      // Load state once — reuse for participant check, room join, and snapshot.
       const state = await loadGameState(redis, gameId)
 
-      // ── Game not found ────────────────────────────────────────────────
       if (!state) {
         log.warn({ gameId, userId }, 'join-game: game not found')
         return
       }
 
-      // ── Participant check ─────────────────────────────────────────────
-      // For finished games (state === 'finished'), fall back to Postgres
-      // for the participant check since we don't have player IDs in Redis.
+      // ── Participant check ──────────────────────────────────────────────────
       let player1Id: number
       let player2Id: number
       let gameStatus: string
 
       if (state === 'finished') {
+        // Hash deleted — must check Postgres for player IDs
         const pg = await prisma.game.findUnique({
           where:  { id: gameId },
           select: { player1Id: true, player2Id: true, status: true },
@@ -81,7 +82,8 @@ export function registerGameHandlers(io: IO, socket: Sock, redis: any): void {
         io.to(`game-${gameId}-user-${opponentId}`).emit('opponent-connected', { userId })
       }
 
-      await sendSnapshot(socket, redis, gameId, userId)
+      // Pass the already-loaded state through so sendSnapshot doesn't reload it
+      await sendSnapshot(socket, redis, gameId, userId, state)
 
       log.info({ gameId, userId }, 'user joined game')
 
@@ -96,16 +98,15 @@ async function sendSnapshot(
   redis:  any,
   gameId: number,
   userId: number,
+  // Accept the already-loaded state so we don't call loadGameState again
+  state: Awaited<ReturnType<typeof loadGameState>>,
 ): Promise<void> {
   try {
-    const state = await loadGameState(redis, gameId)
-
     if (!state) {
       log.warn({ gameId, userId }, 'snapshot: game not found')
       return
     }
 
-    // ── Finished game — read full state from Postgres ─────────────────────
     if (state === 'finished') {
       await sendFinishedSnapshot(socket, gameId, userId)
       return
@@ -114,7 +115,6 @@ async function sendSnapshot(
     const isWhite = state.whitePlayerId === userId
     let maskedFen = state.fen
 
-    // ── FEN masking during prep ───────────────────────────────────────────
     if (state.status === 'prep' && state.draft1Fen && state.draft2Fen) {
       const originalFen = buildCombinedDraftFen(state.draft1Fen, state.draft2Fen)
       maskedFen = maskOpponentAuxPlacements(state.fen, originalFen, isWhite)
@@ -122,7 +122,6 @@ async function sendSnapshot(
       log.warn({ gameId }, 'snapshot: draft FEN missing during prep')
     }
 
-    // ── Timer calculation ─────────────────────────────────────────────────
     let timeRemainingOnMove = MOVE_TIME_LIMIT
     if (state.status === 'active' && state.lastMoveAt > 0) {
       const fenTurn = state.fen.split(' ')[1]
@@ -163,7 +162,6 @@ async function sendSnapshot(
   }
 }
 
-// ── Finished game snapshot — reads from Postgres ──────────────────────────────
 async function sendFinishedSnapshot(
   socket: Sock,
   gameId: number,

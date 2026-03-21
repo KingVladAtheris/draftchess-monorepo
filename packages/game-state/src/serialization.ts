@@ -1,22 +1,11 @@
 // packages/game-state/src/serialization.ts
 //
-// Converts between the typed GameState object and the raw Redis hash.
-// Redis stores everything as strings — these helpers handle all parsing
-// and encoding so consumers never touch raw string conversion.
-//
-// Convention:
-//   booleans  → "0" | "1"
-//   numbers   → numeric string e.g. "1200"
-//   strings   → as-is
-//   absent    → "0" for numeric/boolean, "" for strings
-//
-// Every field is always present in a seeded hash.
-// deserialize() never returns undefined fields — missing fields get defaults.
+// CHANGES:
+//   - Added drawDeclinedMoveNumber to deserialize, serializeSeed, serializeUpdate
+//   - Added rematchOfferedAt to deserialize, serializeSeed, serializeUpdate
 
 import type { GameMode }      from '@draftchess/shared'
 import type { GameState, RawGameHash, SeedGameStatePayload } from './types'
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function int(val: string | undefined): number {
   const n = parseInt(val ?? '0', 10)
@@ -38,8 +27,6 @@ function toInt(val: number): string {
 function toBool(val: boolean): string {
   return val ? '1' : '0'
 }
-
-// ── Deserialize — Redis hash → GameState ──────────────────────────────────────
 
 export function deserialize(raw: RawGameHash): GameState {
   return {
@@ -74,17 +61,15 @@ export function deserialize(raw: RawGameHash): GameState {
     player1GamesPlayed: int(raw.player1GamesPlayed),
     player2GamesPlayed: int(raw.player2GamesPlayed),
 
-    drawOfferedBy:      int(raw.drawOfferedBy),
+    drawOfferedBy:          int(raw.drawOfferedBy),
+    drawDeclinedMoveNumber: int(raw.drawDeclinedMoveNumber),
+
     rematchRequestedBy: int(raw.rematchRequestedBy),
+    rematchOfferedAt:   int(raw.rematchOfferedAt),
   }
 }
 
-// ── Serialize seed payload — SeedGameStatePayload → flat string record ────────
-// Used by seedGameState() to write the initial hash in one HSET call.
-
 export function serializeSeed(payload: SeedGameStatePayload): string[] {
-  // HSET key field1 value1 field2 value2 ...
-  // Returns the flat array of alternating field/value pairs.
   return [
     'gameId',        toInt(payload.gameId),
     'player1Id',     toInt(payload.player1Id),
@@ -117,23 +102,20 @@ export function serializeSeed(payload: SeedGameStatePayload): string[] {
     'player1GamesPlayed', toInt(payload.player1GamesPlayed),
     'player2GamesPlayed', toInt(payload.player2GamesPlayed),
 
-    'drawOfferedBy',      '0',
+    'drawOfferedBy',          '0',
+    'drawDeclinedMoveNumber', '0',
+
     'rematchRequestedBy', '0',
+    'rematchOfferedAt',   '0',
   ]
 }
-
-// ── Serialize partial update — UpdateGameStatePayload → flat string record ─────
-// Used by updateGameState() for partial hash updates.
-// Only includes fields that are explicitly provided.
 
 export function serializeUpdate(
   update: Partial<Omit<GameState, 'gameId'>>
 ): string[] {
   const pairs: string[] = []
 
-  const push = (field: string, val: string) => {
-    pairs.push(field, val)
-  }
+  const push = (field: string, val: string) => { pairs.push(field, val) }
 
   if (update.player1Id     !== undefined) push('player1Id',     toInt(update.player1Id))
   if (update.player2Id     !== undefined) push('player2Id',     toInt(update.player2Id))
@@ -164,8 +146,11 @@ export function serializeUpdate(
   if (update.player1GamesPlayed !== undefined) push('player1GamesPlayed', toInt(update.player1GamesPlayed))
   if (update.player2GamesPlayed !== undefined) push('player2GamesPlayed', toInt(update.player2GamesPlayed))
 
-  if (update.drawOfferedBy      !== undefined) push('drawOfferedBy',      toInt(update.drawOfferedBy))
+  if (update.drawOfferedBy          !== undefined) push('drawOfferedBy',          toInt(update.drawOfferedBy))
+  if (update.drawDeclinedMoveNumber !== undefined) push('drawDeclinedMoveNumber', toInt(update.drawDeclinedMoveNumber))
+
   if (update.rematchRequestedBy !== undefined) push('rematchRequestedBy', toInt(update.rematchRequestedBy))
+  if (update.rematchOfferedAt   !== undefined) push('rematchOfferedAt',   toInt(update.rematchOfferedAt))
 
   return pairs
 }

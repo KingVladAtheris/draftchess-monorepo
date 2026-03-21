@@ -1,13 +1,11 @@
 // packages/game-state/src/client.ts
 //
-// All Redis operations on the game:{id} hash.
-// This is the only file that issues Redis commands against game state.
-// Every consumer imports from here — nobody writes raw Redis hash commands.
-//
-// The RedisClientType passed in is the connected redis client from the
-// calling process. We don't create our own connection here — each process
-// (web, socket-server, matchmaker) manages its own Redis client and passes
-// it in. This avoids hidden connection proliferation.
+// CHANGES:
+//   - offerDraw: enforces cooldown and duplicate-offer check via Lua
+//   - declineDraw: atomically clears offer and records decline move number
+//   - cancelDraw: lets the offerer withdraw their offer
+//   - offerRematch: sets rematch state on a finished game
+//   - cancelRematch: clears rematch state (navigation away / expiry)
 
 import type { RedisClientType } from 'redis'
 import {
@@ -20,7 +18,11 @@ import {
   PLACE_SCRIPT,
   READY_SCRIPT,
   DRAW_OFFER_SCRIPT,
+  DRAW_DECLINE_SCRIPT,
+  DRAW_CANCEL_SCRIPT,
   FINISH_SCRIPT,
+  REMATCH_OFFER_SCRIPT,
+  REMATCH_CANCEL_SCRIPT,
 } from './lua'
 import type {
   GameState,
@@ -29,62 +31,42 @@ import type {
   LuaMoveResult,
   LuaPlaceResult,
   LuaReadyResult,
+  LuaDrawOfferResult,
+  LuaDrawDeclineResult,
+  LuaRematchOfferResult,
 } from './types'
-
-// ── Key helpers ───────────────────────────────────────────────────────────────
 
 export function gameKey(gameId: number): string {
   return `game:${gameId}`
 }
 
-// TTL for active game hashes.
-// 4 hours covers the longest possible game plus prep time.
-// The matchmaker DELs the key explicitly on finalization —
-// this TTL is a safety net for games that fall through cleanup.
 const GAME_TTL_SECONDS = 4 * 60 * 60
+const DRAW_COOLDOWN_MOVES = 3
+const REMATCH_EXPIRY_MS   = 30_000
 
-// ── Seed ─────────────────────────────────────────────────────────────────────
+// ── Seed ──────────────────────────────────────────────────────────────────────
 
-/**
- * Write the initial game hash to Redis.
- * Called by the matchmaker immediately after creating the Game row in Postgres.
- * Sets a 4-hour TTL as a safety net.
- */
 export async function seedGameState(
   redis: RedisClientType,
   payload: SeedGameStatePayload,
 ): Promise<void> {
   const key    = gameKey(payload.gameId)
   const fields = serializeSeed(payload)
-
-  // HSET with multiple field/value pairs in one call
   await (redis as any).hSet(key, fields)
   await redis.expire(key, GAME_TTL_SECONDS)
 }
 
 // ── Read ──────────────────────────────────────────────────────────────────────
 
-/**
- * Read the full game state from Redis.
- * Returns null if the key does not exist (game not in Redis).
- * Callers must handle null via the fallback path in fallback.ts.
- */
 export async function getGameState(
   redis: RedisClientType,
   gameId: number,
 ): Promise<GameState | null> {
   const raw = await redis.hGetAll(gameKey(gameId))
-
-  // hGetAll returns {} for a missing key, not null
   if (!raw || Object.keys(raw).length === 0) return null
-
   return deserialize(raw)
 }
 
-/**
- * Read a single field from the game hash.
- * Useful for lightweight checks (e.g. status only) without loading the full hash.
- */
 export async function getGameField(
   redis: RedisClientType,
   gameId: number,
@@ -96,12 +78,6 @@ export async function getGameField(
 
 // ── Update ────────────────────────────────────────────────────────────────────
 
-/**
- * Partially update the game hash.
- * Only fields present in the payload are written.
- * Not atomic with respect to reads — use Lua scripts for operations
- * that require read-modify-write atomicity.
- */
 export async function updateGameState(
   redis: RedisClientType,
   gameId: number,
@@ -114,10 +90,6 @@ export async function updateGameState(
 
 // ── Delete ────────────────────────────────────────────────────────────────────
 
-/**
- * Delete the game hash from Redis.
- * Called by the matchmaker after writing the final game state to Postgres.
- */
 export async function deleteGameState(
   redis: RedisClientType,
   gameId: number,
@@ -127,17 +99,13 @@ export async function deleteGameState(
 
 // ── Lua: move ─────────────────────────────────────────────────────────────────
 
-/**
- * Atomically update game state after a valid move.
- * Validates the game is still active before writing.
- */
 export async function applyMove(
   redis: RedisClientType,
   gameId:          number,
   fen:             string,
   moveNumber:      number,
-  lastMoveAt:      number,  // Unix ms
-  lastMoveBy:      number,  // userId
+  lastMoveAt:      number,
+  lastMoveBy:      number,
   player1Timebank: number,
   player2Timebank: number,
 ): Promise<LuaMoveResult> {
@@ -159,12 +127,6 @@ export async function applyMove(
 
 // ── Lua: place ────────────────────────────────────────────────────────────────
 
-/**
- * Atomically place an aux piece during prep.
- * Checks points, updates FEN and decrements aux points in one operation.
- *
- * pointsField: 'auxPointsPlayer1' or 'auxPointsPlayer2'
- */
 export async function placePiece(
   redis: RedisClientType,
   gameId:      number,
@@ -179,25 +141,16 @@ export async function placePiece(
 
   if (result >= 0) return { ok: true, newAuxPoints: result }
   if (result === -1) return { ok: false, reason: 'not_prep' }
-  if (result === -2) return { ok: false, reason: 'insufficient_points' }
   return { ok: false, reason: 'insufficient_points' }
 }
 
 // ── Lua: ready ────────────────────────────────────────────────────────────────
 
-/**
- * Atomically mark a player ready.
- * If both players are ready, transitions the game to active.
- * Returns bothReady: true if the game just transitioned — caller should
- * publish to draftchess:game-started.
- *
- * isPlayer1: true if the player calling ready is player1
- */
 export async function markReady(
   redis: RedisClientType,
   gameId:          number,
   isPlayer1:       boolean,
-  now:             number,  // Unix ms
+  now:             number,
   player1Timebank: number,
   player2Timebank: number,
 ): Promise<LuaReadyResult> {
@@ -224,16 +177,57 @@ export async function markReady(
 
 // ── Lua: draw offer ───────────────────────────────────────────────────────────
 
-/**
- * Set or clear the draw offer on the game hash.
- * userId: the player making the offer. Pass 0 to clear.
- */
-export async function setDrawOffer(
+export async function offerDraw(
+  redis: RedisClientType,
+  gameId:      number,
+  userId:      number,
+  moveNumber:  number,
+): Promise<LuaDrawOfferResult> {
+  const result = await redis.eval(DRAW_OFFER_SCRIPT, {
+    keys: [gameKey(gameId)],
+    arguments: [
+      String(userId),
+      String(moveNumber),
+      String(DRAW_COOLDOWN_MOVES),
+    ],
+  }) as number
+
+  if (result === 1)  return { ok: true }
+  if (result === 0)  return { ok: false, reason: 'not_active' }
+  if (result === -1) return { ok: false, reason: 'cooldown' }
+  if (result === -2) return { ok: false, reason: 'already_offered' }
+  return { ok: false, reason: 'not_active' }
+}
+
+// ── Lua: draw decline ─────────────────────────────────────────────────────────
+
+export async function declineDraw(
+  redis: RedisClientType,
+  gameId:     number,
+  moveNumber: number,
+): Promise<LuaDrawDeclineResult> {
+  const result = await redis.eval(DRAW_DECLINE_SCRIPT, {
+    keys: [gameKey(gameId)],
+    arguments: [
+      '0', // userId not needed — any non-offerer can decline
+      String(moveNumber),
+    ],
+  }) as number
+
+  if (result === 1)  return { ok: true }
+  if (result === 0)  return { ok: false, reason: 'not_active' }
+  if (result === -1) return { ok: false, reason: 'no_offer' }
+  return { ok: false, reason: 'not_active' }
+}
+
+// ── Lua: draw cancel ──────────────────────────────────────────────────────────
+
+export async function cancelDraw(
   redis: RedisClientType,
   gameId: number,
   userId: number,
 ): Promise<boolean> {
-  const result = await redis.eval(DRAW_OFFER_SCRIPT, {
+  const result = await redis.eval(DRAW_CANCEL_SCRIPT, {
     keys: [gameKey(gameId)],
     arguments: [String(userId)],
   }) as number
@@ -242,15 +236,6 @@ export async function setDrawOffer(
 
 // ── Lua: finish ───────────────────────────────────────────────────────────────
 
-/**
- * Atomically transition the game to finished.
- * Returns true if this call made the transition (i.e. game was active).
- * Returns false if the game was already finished or not active —
- * another path got there first, no action needed.
- *
- * Called by the move route when it detects a terminal position,
- * before publishing to draftchess:game-ended.
- */
 export async function markGameFinished(
   redis: RedisClientType,
   gameId: number,
@@ -262,16 +247,51 @@ export async function markGameFinished(
   return result === 1
 }
 
+// ── Lua: rematch offer ────────────────────────────────────────────────────────
+
+export async function offerRematch(
+  redis: RedisClientType,
+  gameId: number,
+  userId: number,
+): Promise<LuaRematchOfferResult> {
+  const now    = Date.now()
+  const result = await redis.eval(REMATCH_OFFER_SCRIPT, {
+    keys: [gameKey(gameId)],
+    arguments: [String(userId), String(now)],
+  }) as number
+
+  if (result === 1)  return { ok: true }
+  if (result === 0)  return { ok: false, reason: 'not_finished' }
+  if (result === -1) return { ok: false, reason: 'already_offered' }
+  return { ok: false, reason: 'not_finished' }
+}
+
+// ── Lua: rematch cancel ───────────────────────────────────────────────────────
+
+export async function cancelRematch(
+  redis: RedisClientType,
+  gameId: number,
+): Promise<boolean> {
+  const result = await redis.eval(REMATCH_CANCEL_SCRIPT, {
+    keys: [gameKey(gameId)],
+    arguments: [],
+  }) as number
+  return result === 1
+}
+
 // ── Exists check ──────────────────────────────────────────────────────────────
 
-/**
- * Check if a game hash exists in Redis without loading it.
- * Useful for cold start detection before doing a full hGetAll.
- */
 export async function gameExists(
   redis: RedisClientType,
   gameId: number,
 ): Promise<boolean> {
   const exists = await redis.exists(gameKey(gameId))
   return exists === 1
+}
+
+// ── Rematch expiry check helper ───────────────────────────────────────────────
+// Used by the accept route to reject stale offers without a Lua round-trip.
+
+export function isRematchExpired(offeredAtMs: number): boolean {
+  return Date.now() - offeredAtMs > REMATCH_EXPIRY_MS
 }

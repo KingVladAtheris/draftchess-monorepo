@@ -1,33 +1,16 @@
 // packages/game-state/src/lua.ts
 //
-// Lua scripts for atomic operations on the game hash.
-// Each script runs atomically on the Redis server — no race conditions.
-//
-// Scripts are defined as string constants and loaded via client.defineCommand()
-// or passed directly to client.eval(). We use evalSha via defineCommand for
-// efficiency — the script is sent once and referenced by SHA thereafter.
-//
-// Return value conventions (Lua → Redis client):
-//   Lua 1          → number 1  (success)
-//   Lua 0          → number 0  (soft failure, check reason)
-//   Lua error()    → throws in the calling code
-//   Lua table      → array of bulk strings
+// CHANGES:
+//   - DRAW_OFFER_SCRIPT: now enforces 3-move cooldown by checking
+//     drawDeclinedMoveNumber, and rejects if an offer is already pending.
+//   - DRAW_DECLINE_SCRIPT: atomically clears drawOfferedBy and writes
+//     drawDeclinedMoveNumber so the cooldown starts from this move.
+//   - REMATCH_OFFER_SCRIPT: sets rematchRequestedBy and rematchOfferedAt
+//     atomically, only when game is finished and no offer is pending.
+//   - REMATCH_CANCEL_SCRIPT: clears rematch state atomically, used when
+//     a player navigates away or the 30s expiry fires.
 
 // ── Move script ───────────────────────────────────────────────────────────────
-// Atomically validates game is active and updates all move-related fields.
-//
-// KEYS[1]  = game:{id}
-// ARGV[1]  = new fen
-// ARGV[2]  = new moveNumber
-// ARGV[3]  = lastMoveAt (Unix ms string)
-// ARGV[4]  = lastMoveBy (userId string)
-// ARGV[5]  = new player1Timebank
-// ARGV[6]  = new player2Timebank
-//
-// Returns:
-//   1  = success
-//   0  = game not active (already finished or still in prep)
-
 export const MOVE_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
 if status ~= 'active' then
@@ -45,18 +28,6 @@ return 1
 `
 
 // ── Place script ──────────────────────────────────────────────────────────────
-// Atomically checks aux points and places a piece during prep.
-//
-// KEYS[1]  = game:{id}
-// ARGV[1]  = points field name ('auxPointsPlayer1' or 'auxPointsPlayer2')
-// ARGV[2]  = piece cost (integer string)
-// ARGV[3]  = new fen after placement
-//
-// Returns:
-//   new aux points remaining (integer >= 0)  = success
-//  -1  = game not in prep
-//  -2  = insufficient points
-
 export const PLACE_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
 if status ~= 'prep' then
@@ -74,21 +45,6 @@ return remaining
 `
 
 // ── Ready script ──────────────────────────────────────────────────────────────
-// Marks one player ready. If both are ready, transitions to active.
-//
-// KEYS[1]  = game:{id}
-// ARGV[1]  = this player's ready field ('readyPlayer1' or 'readyPlayer2')
-// ARGV[2]  = opponent's ready field    ('readyPlayer2' or 'readyPlayer1')
-// ARGV[3]  = lastMoveAt for active transition (Unix ms string, i.e. now)
-// ARGV[4]  = player1Timebank for active transition
-// ARGV[5]  = player2Timebank for active transition
-//
-// Returns:
-//   2  = both ready, game transitioned to active — caller publishes game-started
-//   1  = this player marked ready, waiting for opponent
-//   0  = game not in prep
-//  -1  = this player was already ready
-
 export const READY_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
 if status ~= 'prep' then
@@ -115,40 +71,145 @@ return 1
 `
 
 // ── Draw offer script ─────────────────────────────────────────────────────────
-// Sets or clears drawOfferedBy atomically.
+// Atomically validates and sets a draw offer.
 //
 // KEYS[1]  = game:{id}
-// ARGV[1]  = userId making the offer (string), or '0' to clear
+// ARGV[1]  = userId making the offer (string)
+// ARGV[2]  = current moveNumber (string) — for cooldown check
+// ARGV[3]  = cooldown moves required (string, "3")
 //
 // Returns:
-//   1  = offer set or cleared
+//   1  = offer set successfully
 //   0  = game not active
+//  -1  = cooldown not elapsed (declined too recently)
+//  -2  = offer already pending from this player or opponent
 
 export const DRAW_OFFER_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
 if status ~= 'active' then
   return 0
 end
+local existing = tonumber(redis.call('HGET', KEYS[1], 'drawOfferedBy')) or 0
+if existing ~= 0 then
+  return -2
+end
+local declinedAt = tonumber(redis.call('HGET', KEYS[1], 'drawDeclinedMoveNumber')) or 0
+local currentMove = tonumber(ARGV[2]) or 0
+local cooldown = tonumber(ARGV[3]) or 3
+if declinedAt ~= 0 and (currentMove - declinedAt) < cooldown then
+  return -1
+end
 redis.call('HSET', KEYS[1], 'drawOfferedBy', ARGV[1])
 return 1
 `
 
-// ── Finish script ─────────────────────────────────────────────────────────────
-// Transitions game to finished atomically.
-// Used by the move route when it detects a terminal position,
-// before publishing to draftchess:game-ended.
+// ── Draw decline script ───────────────────────────────────────────────────────
+// Atomically clears the draw offer and records the move number for cooldown.
 //
 // KEYS[1]  = game:{id}
+// ARGV[1]  = userId declining (must be the non-offerer)
+// ARGV[2]  = current moveNumber (string)
 //
 // Returns:
-//   1  = transitioned to finished
-//   0  = game was not active (another path already finished it)
+//   1  = declined successfully
+//   0  = game not active
+//  -1  = no pending offer to decline
 
+export const DRAW_DECLINE_SCRIPT = `
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'active' then
+  return 0
+end
+local offeredBy = tonumber(redis.call('HGET', KEYS[1], 'drawOfferedBy')) or 0
+if offeredBy == 0 then
+  return -1
+end
+redis.call('HMSET', KEYS[1],
+  'drawOfferedBy',          '0',
+  'drawDeclinedMoveNumber', ARGV[2]
+)
+return 1
+`
+
+// ── Draw cancel script ────────────────────────────────────────────────────────
+// Lets the offering player withdraw their draw offer.
+//
+// KEYS[1]  = game:{id}
+// ARGV[1]  = userId cancelling (must be the offerer)
+//
+// Returns:
+//   1  = cancelled successfully
+//   0  = game not active or no offer from this player
+
+export const DRAW_CANCEL_SCRIPT = `
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'active' then
+  return 0
+end
+local offeredBy = redis.call('HGET', KEYS[1], 'drawOfferedBy')
+if offeredBy ~= ARGV[1] then
+  return 0
+end
+redis.call('HSET', KEYS[1], 'drawOfferedBy', '0')
+return 1
+`
+
+// ── Finish script ─────────────────────────────────────────────────────────────
 export const FINISH_SCRIPT = `
 local status = redis.call('HGET', KEYS[1], 'status')
 if status ~= 'active' then
   return 0
 end
 redis.call('HSET', KEYS[1], 'status', 'finished')
+return 1
+`
+
+// ── Rematch offer script ──────────────────────────────────────────────────────
+// Atomically sets a rematch offer on a finished game.
+//
+// KEYS[1]  = game:{id}
+// ARGV[1]  = userId making the offer (string)
+// ARGV[2]  = current Unix ms timestamp (string) — stored as rematchOfferedAt
+//
+// Returns:
+//   1  = offer set successfully
+//   0  = game not finished
+//  -1  = rematch offer already pending
+
+export const REMATCH_OFFER_SCRIPT = `
+local status = redis.call('HGET', KEYS[1], 'status')
+if status ~= 'finished' then
+  return 0
+end
+local existing = tonumber(redis.call('HGET', KEYS[1], 'rematchRequestedBy')) or 0
+if existing ~= 0 then
+  return -1
+end
+redis.call('HMSET', KEYS[1],
+  'rematchRequestedBy', ARGV[1],
+  'rematchOfferedAt',   ARGV[2]
+)
+return 1
+`
+
+// ── Rematch cancel script ─────────────────────────────────────────────────────
+// Clears rematch state. Called when a player navigates away or the 30s
+// expiry fires server-side.
+//
+// KEYS[1]  = game:{id}
+//
+// Returns:
+//   1  = cleared (offer existed)
+//   0  = no offer was pending
+
+export const REMATCH_CANCEL_SCRIPT = `
+local existing = tonumber(redis.call('HGET', KEYS[1], 'rematchRequestedBy')) or 0
+if existing == 0 then
+  return 0
+end
+redis.call('HMSET', KEYS[1],
+  'rematchRequestedBy', '0',
+  'rematchOfferedAt',   '0'
+)
 return 1
 `

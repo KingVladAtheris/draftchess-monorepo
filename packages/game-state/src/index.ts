@@ -1,6 +1,5 @@
 // packages/game-state/src/index.ts
 
-// Types
 export type {
   GameState,
   SeedGameStatePayload,
@@ -8,10 +7,12 @@ export type {
   LuaMoveResult,
   LuaPlaceResult,
   LuaReadyResult,
+  LuaDrawOfferResult,
+  LuaDrawDeclineResult,
+  LuaRematchOfferResult,
   RawGameHash,
 } from './types'
 
-// Redis client operations
 export {
   gameKey,
   seedGameState,
@@ -22,19 +23,26 @@ export {
   applyMove,
   placePiece,
   markReady,
-  setDrawOffer,
+  offerDraw,
+  declineDraw,
+  cancelDraw,
   markGameFinished,
+  offerRematch,
+  cancelRematch,
+  isRematchExpired,
   gameExists,
 } from './client'
 
-// Cold start fallback
 export { loadGameState } from './fallback'
 
-// Lua scripts (exported for testing and debugging)
 export {
   MOVE_SCRIPT,
   PLACE_SCRIPT,
   READY_SCRIPT,
   DRAW_OFFER_SCRIPT,
+  DRAW_DECLINE_SCRIPT,
+  DRAW_CANCEL_SCRIPT,
   FINISH_SCRIPT,
+  REMATCH_OFFER_SCRIPT,
+  REMATCH_CANCEL_SCRIPT,
 } from './lua'
