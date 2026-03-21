@@ -4,6 +4,8 @@
     "outDir":    "./dist",
     "rootDir":   "./src",
     "composite": true,
+    "moduleResolution": "bundler",
+    "module":           "esnext",
     "paths": {
       "@draftchess/db":      ["../../packages/db/src/index.ts"],
       "@draftchess/shared":  ["../../packages/shared/src/index.ts"],

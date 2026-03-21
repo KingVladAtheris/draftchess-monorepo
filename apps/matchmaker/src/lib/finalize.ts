@@ -1,13 +1,10 @@
 // apps/matchmaker/src/lib/finalize.ts
 //
-// Single source of truth for all game finalization.
-// Called by: timeout worker, forfeit subscriber, reconcile worker,
-//            game-ended subscriber (new — replaces web app's updateGameResult).
-//
-// Writes ELO, stats, and game outcome to Postgres.
-// Deletes the Redis game hash after persisting.
-// Never called from the web app — the web app publishes to
-// draftchess:game-ended and this module handles it.
+// CHANGE: Draw ELO calculation now uses each player's own game count for
+// their K-factor instead of always using p1Games for both sides.
+// Previously: calculateEloChange(p1Elo, p2Elo, p1Games, true) was called
+// for draws, which used player1's game count to determine player2's K-factor.
+// Now each player's change is calculated independently using their own count.
 
 import { Prisma, prisma }              from '@draftchess/db'
 import { calculateEloChange, MIN_ELO } from '@draftchess/shared/elo'
@@ -47,7 +44,6 @@ export async function finalizeGame(
 ): Promise<FinalizeResult | null> {
 
   // ── Friend games ─────────────────────────────────────────────────────────────
-  // Mark finished and clear queue state, but skip ELO / stat updates entirely.
   if (isFriendGame) {
     let finalized = false
     try {
@@ -87,9 +83,16 @@ export async function finalizeGame(
   let p2Change: number
 
   if (isDraw) {
-    const r = calculateEloChange(p1EloBefore, p2EloBefore, p1Games, true)
-    p1Change = r.winnerChange
-    p2Change = r.loserChange
+    // FIX: use each player's own game count for their K-factor.
+    // Previously both sides used p1Games, giving player2 the wrong K-factor.
+    // For draws we calculate each player's change from their own perspective:
+    //   - treat each player as the "winner" with score 0.5
+    //   - calculateEloChange with isDraw=true returns symmetric-ish changes
+    //   - but K-factor must come from the player whose change we're computing
+    const r1 = calculateEloChange(p1EloBefore, p2EloBefore, p1Games, true)
+    const r2 = calculateEloChange(p2EloBefore, p1EloBefore, p2Games, true)
+    p1Change = r1.winnerChange  // p1's change (K based on p1Games)
+    p2Change = r2.winnerChange  // p2's change (K based on p2Games)
   } else if (winnerId === player1Id) {
     const r = calculateEloChange(p1EloBefore, p2EloBefore, p1Games, false)
     p1Change = r.winnerChange
@@ -116,8 +119,6 @@ export async function finalizeGame(
 
   try {
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      // Optimistic concurrency guard — only finishes a game that is still active.
-      // If another code path already finished it, count === 0 and we bail.
       const guard = await tx.game.updateMany({
         where: { id: gameId, status: 'active' },
         data:  { status: 'finished' },
@@ -167,8 +168,18 @@ export async function finalizeGame(
   }
 
   if (finalized) {
-    // Delete Redis hash now that Postgres has the final state
     await deleteGameState(redis, gameId)
+
+    // Clear the matched:{userId} keys written by the match worker.
+    // These keys drive the queue/status fast path — if left alive they
+    // redirect both players back to this finished game for up to 5 minutes.
+    await Promise.all([
+      redis.del(`matched:${player1Id}`),
+      redis.del(`matched:${player2Id}`),
+    ]).catch((err: any) => {
+      log.warn({ gameId, err: err.message }, 'failed to clear matched keys — will expire naturally')
+    })
+
     log.info(
       { gameId, mode, endReason, newP1Elo, newP2Elo, eloChange },
       'game finalized',

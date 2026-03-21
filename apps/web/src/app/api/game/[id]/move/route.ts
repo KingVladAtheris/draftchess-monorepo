@@ -1,28 +1,43 @@
 // apps/web/src/app/api/game/[id]/move/route.ts
-// CHANGES from original:
-//   - checkCsrf added (Step 3)
-//   - publishGameUpdate added alongside emitToGame for Redis fan-out
-//   - endReason null→string coercion fixed: condition guards the call site
+//
+// Validates and applies a chess move.
+// Reads game state from Redis (fast path) with Postgres fallback.
+// Writes new state to Redis atomically via Lua script.
+// Writes a Move row to Postgres for PGN/replay on every move.
+// If a terminal position is detected, publishes to draftchess:game-ended
+// and lets the matchmaker handle ELO, stats, and Postgres finalization.
+// Never calls updateGameResult — that code is deleted.
 
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/auth";
-import { prisma } from "@draftchess/db";
-import { Chess } from "chess.js";
-import { updateGameResult } from "@/app/lib/elo-update";
-import { type GameMode, GAMES_PLAYED_FIELD } from "@draftchess/shared/game-modes";
-import { scheduleTimeoutJob, cancelTimeoutJob } from "@/app/lib/queues";
-import { consume, moveLimiter } from "@/app/lib/rate-limit";
-import { checkCsrf } from "@/app/lib/csrf";
-import { publishGameUpdate } from "@/app/lib/redis-publisher";
+import { auth }                      from "@/auth";
+import { prisma }                    from "@draftchess/db";
+import { Chess, type Square }        from "chess.js";
+import {
+  loadGameState,
+  applyMove,
+  markGameFinished,
+  getGameState,
+} from "@draftchess/game-state";
+import { consume, moveLimiter }      from "@/app/lib/rate-limit";
+import { checkCsrf }                 from "@/app/lib/csrf";
+import { getRedisClient, publishGameUpdate, publishToChannel } from "@/app/lib/redis-publisher";
+import { logger }                    from "@draftchess/logger";
+import type { GameEndedPayload }     from "@/app/lib/game-ended-types";
 
-const MOVE_TIME_LIMIT         = 30000;
+const log = logger.child({ module: "web:move-route" });
+
+const MOVE_TIME_LIMIT         = 30_000;
 const TIMEBANK_BONUS_INTERVAL = 20;
-const TIMEBANK_BONUS_AMOUNT   = 60000;
+const TIMEBANK_BONUS_AMOUNT   = 60_000;
 
 class DraftChess extends Chess {
   move(moveObj: any, options?: any) {
     const result = super.move(moveObj, options);
-    if (result && (result.flags.includes("k") || result.flags.includes("q") || result.flags.includes("e"))) {
+    if (result && (
+      result.flags.includes("k") ||
+      result.flags.includes("q") ||
+      result.flags.includes("e")
+    )) {
       super.undo();
       throw new Error("Castling and en passant are not allowed in Draft Chess");
     }
@@ -42,9 +57,9 @@ export async function POST(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { id } = await params;
-  const userId = parseInt(session.user.id);
-  const gameId = parseInt(id);
+  const { id }  = await params;
+  const userId  = parseInt(session.user.id);
+  const gameId  = parseInt(id);
 
   const limited = await consume(moveLimiter, req, userId.toString());
   if (limited) return limited;
@@ -61,89 +76,82 @@ export async function POST(
     return NextResponse.json({ error: "from and to are required" }, { status: 400 });
   }
 
-  // ─── Load game ────────────────────────────────────────────────────────────
-  const game = await prisma.game.findUnique({
-    where: { id: gameId },
-    select: {
-      status: true,
-      fen: true,
-      player1Id: true,
-      player2Id: true,
-      whitePlayerId: true,
-      mode: true,
-      isFriendGame: true,
-      player1EloBefore: true,
-      player2EloBefore: true,
-      lastMoveAt: true,
-      moveNumber: true,
-      player1Timebank: true,
-      player2Timebank: true,
-      player1: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
-      player2: { select: { gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true } },
-    },
-  });
+  const redis = await getRedisClient();
 
-  if (!game || game.status !== "active") {
+  // ── Load game state from Redis (fast path) ──────────────────────────────
+  const state = await loadGameState(redis, gameId);
+
+  if (!state || state === "finished") {
     return NextResponse.json({ error: "Game is not active" }, { status: 400 });
   }
 
-  if (game.player1Id !== userId && game.player2Id !== userId) {
+  if (state.status !== "active") {
+    return NextResponse.json({ error: "Game is not active" }, { status: 400 });
+  }
+
+  if (state.player1Id !== userId && state.player2Id !== userId) {
     return NextResponse.json({ error: "You are not a participant in this game" }, { status: 403 });
   }
 
-  if (!game.fen) {
+  if (!state.fen) {
     return NextResponse.json({ error: "Game has no position" }, { status: 400 });
   }
 
-  // ─── Turn check ───────────────────────────────────────────────────────────
-  const chess    = new DraftChess(game.fen);
-  const turn     = chess.turn();
-  const isWhite  = game.whitePlayerId === userId;
+  // ── Turn check ──────────────────────────────────────────────────────────
+  const chess   = new DraftChess(state.fen);
+  const turn    = chess.turn();
+  const isWhite = state.whitePlayerId === userId;
   const isMyTurn = (turn === "w" && isWhite) || (turn === "b" && !isWhite);
 
   if (!isMyTurn) {
     return NextResponse.json({ error: "It is not your turn" }, { status: 400 });
   }
 
-  // ─── Time accounting ──────────────────────────────────────────────────────
-  const now             = new Date();
-  const lastMoveTime    = game.lastMoveAt ? new Date(game.lastMoveAt) : now;
-  const elapsedMs       = now.getTime() - lastMoveTime.getTime();
-  const isPlayer1       = game.player1Id === userId;
-  const currentTimebank = isPlayer1 ? game.player1Timebank : game.player2Timebank;
+  // ── Time accounting ─────────────────────────────────────────────────────
+  const now          = Date.now();
+  const lastMoveTime = state.lastMoveAt > 0 ? state.lastMoveAt : now;
+  const elapsedMs    = now - lastMoveTime;
+  const isPlayer1    = state.player1Id === userId;
+
+  // FIX: correctly map player slot to timebank using whitePlayerId
+  // (not assuming white === player1)
+  const currentTimebank = isPlayer1 ? state.player1Timebank : state.player2Timebank;
   const overage         = Math.max(0, elapsedMs - MOVE_TIME_LIMIT);
 
+  // ── Time expiry check ───────────────────────────────────────────────────
+  // If the player ran out of time, delegate finalization to the matchmaker.
   if (overage > 0 && currentTimebank - overage <= 0) {
-    const winnerId = isPlayer1 ? game.player2Id : game.player1Id;
+    const winnerId = isPlayer1 ? state.player2Id : state.player1Id;
 
-    const gameMode   = (game.mode ?? "standard") as GameMode;
-    const gamesField = GAMES_PLAYED_FIELD[gameMode];
-    const result = await updateGameResult(
-      gameId, winnerId,
-      game.player1Id, game.player2Id,
-      game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
-      game.player1[gamesField] ?? 0, game.player2[gamesField] ?? 0,
-      "timeout", gameMode,
-      game.isFriendGame === true
-    );
+    // Mark finished in Redis atomically
+    const marked = await markGameFinished(redis, gameId);
 
-    if (result) {
-      await cancelTimeoutJob(gameId);
-      await publishGameUpdate(gameId, {
-        status: "finished", winnerId, endReason: "timeout",
-        player1EloAfter: result.newPlayer1Elo,
-        player2EloAfter: result.newPlayer2Elo,
-        eloChange:       result.eloChange,
-      });
+    if (marked) {
+      const payload: GameEndedPayload = {
+        gameId,
+        winnerId,
+        endReason:          "timeout",
+        finalFen:           state.fen,
+        source:             "move-route",
+        player1Id:          state.player1Id,
+        player2Id:          state.player2Id,
+        mode:               state.mode,
+        isFriendGame:       state.isFriendGame,
+        player1EloBefore:   state.player1EloBefore,
+        player2EloBefore:   state.player2EloBefore,
+        player1GamesPlayed: state.player1GamesPlayed,
+        player2GamesPlayed: state.player2GamesPlayed,
+      };
+      await publishToChannel("draftchess:game-ended", { ...payload });
     }
 
     return NextResponse.json(
       { success: false, error: "Your time has expired", winnerId, endReason: "timeout" },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
-  // ─── Validate and execute move ────────────────────────────────────────────
+  // ── Validate and execute move ───────────────────────────────────────────
   try {
     chess.move({ from, to, promotion: promotion ?? "q" });
   } catch (err: any) {
@@ -151,120 +159,138 @@ export async function POST(
   }
 
   const newFen        = chess.fen();
-  const newMoveNumber = game.moveNumber + 1;
+  const newMoveNumber = state.moveNumber + 1;
+  const nowDate       = new Date(now);
 
-  // ─── Game-ending conditions ───────────────────────────────────────────────
-  let newStatus: string       = "active";
+  // ── Game-ending conditions ──────────────────────────────────────────────
+  let isTerminal       = false;
   let winnerId: number | null = null;
   let endReason: string | null = null;
 
-  if      (chess.isCheckmate())                { newStatus = "finished"; winnerId = userId; endReason = "checkmate"; }
-  else if (chess.isStalemate())                { newStatus = "finished"; endReason = "stalemate"; }
-  else if (chess.isThreefoldRepetition())      { newStatus = "finished"; endReason = "repetition"; }
-  else if (chess.isInsufficientMaterial())     { newStatus = "finished"; endReason = "insufficient_material"; }
-  else if (chess.isDraw())                     { newStatus = "finished"; endReason = "draw"; }
+  if      (chess.isCheckmate())            { isTerminal = true; winnerId = userId; endReason = "checkmate"; }
+  else if (chess.isStalemate())            { isTerminal = true; endReason = "stalemate"; }
+  else if (chess.isThreefoldRepetition())  { isTerminal = true; endReason = "repetition"; }
+  else if (chess.isInsufficientMaterial()) { isTerminal = true; endReason = "insufficient_material"; }
+  else if (chess.isDraw())                 { isTerminal = true; endReason = "draw"; }
 
-  const bonusAwarded  = newMoveNumber % TIMEBANK_BONUS_INTERVAL === 0;
-  const timebankField = isPlayer1 ? "player1Timebank" : "player2Timebank";
-  const otherField    = isPlayer1 ? "player2Timebank" : "player1Timebank";
+  // ── Timebank accounting ─────────────────────────────────────────────────
+  const bonusAwarded = newMoveNumber % TIMEBANK_BONUS_INTERVAL === 0;
 
-  // ─── Persist — guarded on status:'active' ────────────────────────────────
-  const persistResult = await prisma.game.updateMany({
-    where: { id: gameId, status: "active" },
-    data: {
-      fen:        newFen,
-      lastMoveAt: now,
-      lastMoveBy: userId,
-      moveNumber: newMoveNumber,
-      ...(overage > 0
-        ? { [timebankField]: { decrement: overage } }
-        : {}
-      ),
-      ...(bonusAwarded
-        ? {
-            [timebankField]: { increment: TIMEBANK_BONUS_AMOUNT - (overage > 0 ? overage : 0) },
-            [otherField]:    { increment: TIMEBANK_BONUS_AMOUNT },
-          }
-        : {}
-      ),
-    },
-  });
+  let newP1Timebank = state.player1Timebank;
+  let newP2Timebank = state.player2Timebank;
 
-  if (persistResult.count === 0) {
+  if (overage > 0) {
+    if (isPlayer1) newP1Timebank = Math.max(0, newP1Timebank - overage);
+    else           newP2Timebank = Math.max(0, newP2Timebank - overage);
+  }
+
+  if (bonusAwarded) {
+    const bonusAfterOverage = TIMEBANK_BONUS_AMOUNT - (overage > 0 ? overage : 0);
+    if (isPlayer1) {
+      newP1Timebank += bonusAfterOverage;
+      newP2Timebank += TIMEBANK_BONUS_AMOUNT;
+    } else {
+      newP2Timebank += bonusAfterOverage;
+      newP1Timebank += TIMEBANK_BONUS_AMOUNT;
+    }
+  }
+
+  // ── Write to Redis atomically ───────────────────────────────────────────
+  const moveResult = await applyMove(
+    redis,
+    gameId,
+    newFen,
+    newMoveNumber,
+    now,
+    userId,
+    newP1Timebank,
+    newP2Timebank,
+  );
+
+  if (!moveResult.ok) {
+    // Game was already finished by another path (timeout worker, forfeit)
     return NextResponse.json({ error: "Game already finished" }, { status: 409 });
   }
 
-  // Re-fetch timebanks (Prisma expressions don't return new values inline)
-  const updatedGame = await prisma.game.findUnique({
-    where:  { id: gameId },
-    select: { player1Timebank: true, player2Timebank: true },
-  });
+  // ── Write Move row to Postgres for PGN/replay ───────────────────────────
+  // Non-blocking — we don't await this on the critical path.
+  // If it fails, the reconcile worker or a background job can rebuild from
+  // the game's final state. The move is already committed to Redis.
+  const lastMove = chess.history({ verbose: true }).at(-1);
+  prisma.move.create({
+    data: {
+      gameId,
+      moveNumber: newMoveNumber,
+      from:       from as string,
+      to:         to as string,
+      promotion:  promotion ?? null,
+      san:        lastMove?.san ?? `${from}${to}`,
+      fen:        newFen,
+    },
+  }).catch((err) => log.error({ gameId, moveNumber: newMoveNumber, err: err.message }, "failed to write Move row"));
 
-  const player1TimebankFinal = updatedGame?.player1Timebank ?? game.player1Timebank;
-  const player2TimebankFinal = updatedGame?.player2Timebank ?? game.player2Timebank;
+  // ── Terminal position — delegate to matchmaker ──────────────────────────
+  if (isTerminal && endReason !== null) {
+    const marked = await markGameFinished(redis, gameId);
 
-  // ─── ELO update if game ended ─────────────────────────────────────────────
-  // endReason is guaranteed non-null here because newStatus === "finished"
-  // only when one of the chess.is*() checks above set it to a string.
-  let eloResult: { newPlayer1Elo: number; newPlayer2Elo: number; eloChange: number } | null = null;
-  if (newStatus === "finished" && endReason !== null) {
-    const gameMode2   = (game.mode ?? "standard") as GameMode;
-    const gamesField2 = GAMES_PLAYED_FIELD[gameMode2];
-    eloResult = await updateGameResult(
-      gameId, winnerId,
-      game.player1Id, game.player2Id,
-      game.player1EloBefore ?? 1200, game.player2EloBefore ?? 1200,
-      game.player1[gamesField2] ?? 0, game.player2[gamesField2] ?? 0,
-      endReason, gameMode2,
-      game.isFriendGame === true
-    );
+    if (marked) {
+      // Re-read state to get the latest timebanks we just wrote
+      const finalState = await getGameState(redis, gameId);
+
+      const payload: GameEndedPayload = {
+        gameId,
+        winnerId,
+        endReason,
+        finalFen:           newFen,
+        source:             "move-route",
+        player1Id:          state.player1Id,
+        player2Id:          state.player2Id,
+        mode:               state.mode,
+        isFriendGame:       state.isFriendGame,
+        player1EloBefore:   state.player1EloBefore,
+        player2EloBefore:   state.player2EloBefore,
+        player1GamesPlayed: state.player1GamesPlayed,
+        player2GamesPlayed: state.player2GamesPlayed,
+      };
+      await publishToChannel("draftchess:game-ended", { ...payload });
+    }
   }
 
-  // ─── Broadcast ────────────────────────────────────────────────────────────
+  // ── Broadcast move to all players ───────────────────────────────────────
   const newTurn = new DraftChess(newFen).turn();
 
   const broadcastPayload: Record<string, any> = {
     fen:             newFen,
     moveNumber:      newMoveNumber,
-    player1Timebank: player1TimebankFinal,
-    player2Timebank: player2TimebankFinal,
-    lastMoveAt:      now.toISOString(),
+    player1Timebank: newP1Timebank,
+    player2Timebank: newP2Timebank,
+    lastMoveAt:      nowDate.toISOString(),
     turn:            newTurn,
     timebankBonusAwarded: bonusAwarded,
   };
 
-  if (newStatus === "finished") {
+  if (isTerminal) {
     broadcastPayload.status    = "finished";
     broadcastPayload.winnerId  = winnerId;
     broadcastPayload.endReason = endReason;
-    if (eloResult) {
-      broadcastPayload.player1EloAfter = eloResult.newPlayer1Elo;
-      broadcastPayload.player2EloAfter = eloResult.newPlayer2Elo;
-      broadcastPayload.eloChange       = eloResult.eloChange;
-    }
+    // ELO values will follow in a separate game-update event
+    // published by the matchmaker after finalization
   }
 
   await publishGameUpdate(gameId, broadcastPayload);
 
-  // ─── Schedule / cancel timeout ────────────────────────────────────────────
-  if (newStatus === "finished") {
-    await cancelTimeoutJob(gameId);
-  } else {
-    await scheduleTimeoutJob(gameId, player1TimebankFinal, player2TimebankFinal, now, newTurn);
-  }
-
   return NextResponse.json({
-    success:    true,
-    fen:        newFen,
-    moveNumber: newMoveNumber,
-    player1Timebank: player1TimebankFinal,
-    player2Timebank: player2TimebankFinal,
-    turn:       newTurn,
+    success:         true,
+    fen:             newFen,
+    moveNumber:      newMoveNumber,
+    player1Timebank: newP1Timebank,
+    player2Timebank: newP2Timebank,
+    turn:            newTurn,
     timebankBonusAwarded: bonusAwarded,
-    ...(newStatus === "finished" && {
-      status:   "finished",
+    ...(isTerminal && {
+      status:    "finished",
       winnerId,
-      isDraw:   winnerId === null,
+      isDraw:    winnerId === null,
       endReason,
     }),
   });

@@ -1,20 +1,16 @@
 // apps/web/src/app/api/challenges/route.ts
-// POST — send a game challenge to a friend.
 //
-// Rules:
-//   - Sender and receiver must be mutual friends (accepted FriendRequest).
-//   - No existing pending challenge between this pair in either direction.
-//   - The sender must own the draft they nominate (if any).
-//   - The draft's mode must match the requested mode.
-//   - Challenge expires after 10 minutes.
+// CHANGE: Added challengeLimiter rate limiting — 5 challenges sent per
+// user per hour. Keyed by userId so it's per-sender regardless of IP.
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/auth";
 import { prisma } from "@draftchess/db";
 import { checkCsrf } from "@/app/lib/csrf";
+import { consume, challengeLimiter } from "@/app/lib/rate-limit";
 import type { GameMode } from "@draftchess/shared/game-modes";
 
-const CHALLENGE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const CHALLENGE_TTL_MS = 10 * 60 * 1000;
 
 export async function POST(req: NextRequest) {
   const csrfError = checkCsrf(req);
@@ -26,6 +22,10 @@ export async function POST(req: NextRequest) {
   }
 
   const senderId = parseInt(session.user.id);
+
+  // Rate limit by userId — prevents spam-challenging after declines.
+  const limited = await consume(challengeLimiter, req, senderId.toString());
+  if (limited) return limited;
 
   let body: { receiverId: number; mode: GameMode; draftId?: number };
   try {
@@ -44,7 +44,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Cannot challenge yourself" }, { status: 400 });
   }
 
-  // ── Verify friendship ──────────────────────────────────────────────────────
   const friendship = await prisma.friendRequest.findFirst({
     where: {
       status: "accepted",
@@ -59,7 +58,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "You must be friends to challenge this player" }, { status: 403 });
   }
 
-  // ── No duplicate pending challenge ────────────────────────────────────────
   const existing = await prisma.gameChallenge.findFirst({
     where: {
       status: "pending",
@@ -74,7 +72,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "A challenge between you two is already pending" }, { status: 409 });
   }
 
-  // ── Validate draft if provided ─────────────────────────────────────────────
   if (draftId) {
     const draft = await prisma.draft.findUnique({
       where:  { id: draftId },
@@ -90,7 +87,6 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // ── Create challenge ───────────────────────────────────────────────────────
   const expiresAt = new Date(Date.now() + CHALLENGE_TTL_MS);
 
   const challenge = await prisma.gameChallenge.create({

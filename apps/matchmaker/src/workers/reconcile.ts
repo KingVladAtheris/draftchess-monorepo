@@ -9,15 +9,15 @@
 // and falls back to Postgres. The staleness threshold is checked against
 // lastMoveAt in the Redis hash rather than the Postgres row.
 
-import { Worker }                    from 'bullmq'
-import { prisma }                    from '@draftchess/db'
-import { type GameMode }             from '@draftchess/shared/game-modes'
-import { getGameState, loadGameState } from '@draftchess/game-state'
-import { finalizeGame }              from '../lib/finalize.js'
-import { publishGameUpdate }         from '../lib/notify.js'
-import { timeoutQueue, redisOpts }   from '../queues.js'
-import { logger }                    from '@draftchess/logger'
-import type { RedisClientType }      from 'redis'
+import { Worker }          from 'bullmq'
+import { prisma }          from '@draftchess/db'
+import { type GameMode }   from '@draftchess/shared/game-modes'
+import { loadGameState }   from '@draftchess/game-state'
+import { finalizeGame }    from '../lib/finalize.js'
+import { publishGameUpdate } from '../lib/notify.js'
+import { timeoutQueue, redisOpts } from '../queues.js'
+import { logger }          from '@draftchess/logger'
+import type { RedisClientType } from 'redis'
 
 const log = logger.child({ module: 'matchmaker:reconcile-worker' })
 
@@ -63,7 +63,8 @@ export function createReconcileWorker(publisher: RedisClientType) {
             continue
           }
 
-          // Load full game state — Redis first, Postgres fallback
+          // Load full game state — Redis first, Postgres fallback.
+          // loadGameState handles both paths; no need to call getGameState directly.
           const state = await loadGameState(publisher, game.id)
 
           if (!state || state === 'finished') {

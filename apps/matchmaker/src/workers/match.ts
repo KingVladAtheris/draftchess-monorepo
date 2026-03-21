@@ -1,4 +1,8 @@
 // apps/matchmaker/src/workers/match.ts
+//
+// CHANGE: After creating a game, writes matched:{userId} to Redis for both
+// players with a 5-minute TTL. The queue/status endpoint reads this key
+// on the fast path, avoiding a Postgres query on every poll tick.
 
 import { Worker }                from 'bullmq'
 import { prisma }                from '@draftchess/db'
@@ -18,7 +22,7 @@ import type { SeedGameStatePayload } from '@draftchess/game-state'
 
 const log = logger.child({ module: 'matchmaker:match-worker' })
 
-// ── ELO pairing helpers ───────────────────────────────────────────────────────
+const MATCHED_KEY_TTL = 300 // 5 minutes
 
 function maxEloDiff(queuedAtMs: number): number {
   const secsWaiting = (Date.now() - queuedAtMs) / 1000
@@ -72,8 +76,6 @@ function findBestMatch(
 
   return best
 }
-
-// ── Worker ────────────────────────────────────────────────────────────────────
 
 export function createMatchWorker(publisher: RedisClientType) {
   const worker = new Worker(
@@ -150,9 +152,6 @@ export function createMatchWorker(publisher: RedisClientType) {
         },
       })
 
-      // ── Seed Redis game hash ───────────────────────────────────────────────
-      // Must happen immediately after Postgres write so every subsequent
-      // operation (place, ready, move) reads from Redis, not Postgres.
       const seedPayload: SeedGameStatePayload = {
         gameId:        game.id,
         player1Id:     player1.id,
@@ -180,6 +179,13 @@ export function createMatchWorker(publisher: RedisClientType) {
         where: { id: { in: [player1.id, player2.id] } },
         data:  { queueStatus: 'in_game', queuedAt: null, queuedDraftId: null },
       })
+
+      // Write matched:{userId} keys so the queue/status endpoint can answer
+      // polling clients from Redis without hitting Postgres.
+      await Promise.all([
+        publisher.set(`matched:${player1.id}`, String(game.id), { EX: MATCHED_KEY_TTL }),
+        publisher.set(`matched:${player2.id}`, String(game.id), { EX: MATCHED_KEY_TTL }),
+      ])
 
       await notifyMatch(publisher, game.id, [player1.id, player2.id])
 

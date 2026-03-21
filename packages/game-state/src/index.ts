@@ -9,7 +9,7 @@ export type {
   LuaPlaceResult,
   LuaReadyResult,
   RawGameHash,
-} from './types.js'
+} from './types'
 
 // Redis client operations
 export {
@@ -25,10 +25,10 @@ export {
   setDrawOffer,
   markGameFinished,
   gameExists,
-} from './client.js'
+} from './client'
 
 // Cold start fallback
-export { loadGameState } from './fallback.js'
+export { loadGameState } from './fallback'
 
 // Lua scripts (exported for testing and debugging)
 export {
@@ -37,4 +37,4 @@ export {
   READY_SCRIPT,
   DRAW_OFFER_SCRIPT,
   FINISH_SCRIPT,
-} from './lua.js'
+} from './lua'

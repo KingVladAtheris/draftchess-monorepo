@@ -1,18 +1,22 @@
 // apps/web/src/app/api/challenges/[id]/route.ts
 //
-// PATCH { action: "accept" | "decline" }
-//   - accept: creates a Game in "prep" status (isFriendGame=true), marks challenge accepted.
-//   - decline: marks challenge declined.
-//
-// DELETE — sender cancels their own pending challenge.
+// CHANGES:
+//   - Accept path now seeds the Redis game hash immediately after Postgres
+//     write, so friend-game prep operations hit Redis on first request.
+//   - Double-accept race condition fixed: GameChallenge status update now
+//     uses updateMany with a status: "pending" guard (row-count check).
+//     Two simultaneous accepts can no longer both read "pending" and both
+//     create a game — the second write returns count=0 and we return 409.
+//   - Redis seed call mirrors what the matchmaker does for ranked games.
 
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/auth";
-import { prisma } from "@draftchess/db";
-import { checkCsrf } from "@/app/lib/csrf";
-import { modeAuxPoints, type GameMode } from "@draftchess/shared/game-modes";
-import { publishGameUpdate } from "@/app/lib/redis-publisher";
-import { buildCombinedDraftFen } from "@draftchess/shared/fen-utils";
+import { NextRequest, NextResponse }   from "next/server";
+import { auth }                        from "@/auth";
+import { prisma }                      from "@draftchess/db";
+import { checkCsrf }                   from "@/app/lib/csrf";
+import { modeAuxPoints, type GameMode, GAMES_PLAYED_FIELD } from "@draftchess/shared/game-modes";
+import { publishGameUpdate, getRedisClient } from "@/app/lib/redis-publisher";
+import { buildCombinedDraftFen }       from "@draftchess/shared/fen-utils";
+import { seedGameState }               from "@draftchess/game-state";
 
 export async function PATCH(
   req: NextRequest,
@@ -45,13 +49,13 @@ export async function PATCH(
   const challenge = await prisma.gameChallenge.findUnique({
     where:  { id: challengeId },
     select: {
-      id:           true,
-      senderId:     true,
-      receiverId:   true,
-      mode:         true,
+      id:            true,
+      senderId:      true,
+      receiverId:    true,
+      mode:          true,
       senderDraftId: true,
-      status:       true,
-      expiresAt:    true,
+      status:        true,
+      expiresAt:     true,
     },
   });
 
@@ -87,73 +91,145 @@ export async function PATCH(
     }
   }
 
-    // ── Accept: create the game ────────────────────────────────────────────────
-  const mode = challenge.mode as GameMode;
+  const mode      = challenge.mode as GameMode;
   const auxPoints = modeAuxPoints(mode);
-
-  // Coin flip for white (identical to matchmaker)
   const senderIsWhite = Math.random() < 0.5;
   const whitePlayerId = senderIsWhite ? challenge.senderId : userId;
 
-  // ── Compute combined FEN exactly like regular matchmaking ─────────────────
-  // This is the key change — now friend challenges behave identically.
-  let gameFen: string | undefined = undefined;
-  if (challenge.senderDraftId && acceptorDraftId) {
-    const [senderDraft, acceptorDraft] = await Promise.all([
-      prisma.draft.findUnique({
-        where: { id: challenge.senderDraftId },
-        select: { fen: true },
-      }),
-      prisma.draft.findUnique({
-        where: { id: acceptorDraftId },
-        select: { fen: true },
-      }),
-    ]);
-
-    if (senderDraft?.fen && acceptorDraft?.fen) {
-      const whiteFen = senderIsWhite ? senderDraft.fen : acceptorDraft.fen;
-      const blackFen = senderIsWhite ? acceptorDraft.fen : senderDraft.fen;
-      gameFen = buildCombinedDraftFen(whiteFen, blackFen);
-    }
-  }
-
-  const [game] = await prisma.$transaction([
-    prisma.game.create({
-      data: {
-        player1Id:        challenge.senderId,
-        player2Id:        userId,
-        whitePlayerId,
-        mode,
-        status:           "prep",
-        isFriendGame:     true,
-        draft1Id:         challenge.senderDraftId ?? null,
-        draft2Id:         acceptorDraftId ?? null,
-        fen:              gameFen,                    // ← now set, exactly like queue
-        prepStartedAt:    new Date(),
-        auxPointsPlayer1: auxPoints,
-        auxPointsPlayer2: auxPoints,
-        player1EloBefore: 0,
-        player2EloBefore: 0,
+  // Fetch ELO/stats for both players so the game hash is fully seeded
+  // (required for ELO calculation on finalization, even for friend games).
+  const gamesField = GAMES_PLAYED_FIELD[mode];
+  const [sender, receiver] = await Promise.all([
+    prisma.user.findUnique({
+      where:  { id: challenge.senderId },
+      select: {
+        eloStandard: true, eloPauper: true, eloRoyal: true,
+        gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true,
       },
-      select: { id: true },
     }),
-    prisma.gameChallenge.update({
-      where: { id: challengeId },
-      data:  { status: "accepted" },
+    prisma.user.findUnique({
+      where:  { id: userId },
+      select: {
+        eloStandard: true, eloPauper: true, eloRoyal: true,
+        gamesPlayedStandard: true, gamesPlayedPauper: true, gamesPlayedRoyal: true,
+      },
     }),
   ]);
 
-  // Notify challenger via their personal socket room so they get redirected
-  // to the game page without needing to refresh.
+  if (!sender || !receiver) {
+    return NextResponse.json({ error: "User not found" }, { status: 404 });
+  }
+
+  // Resolve ELO field for the mode
+  const eloField = mode === "standard" ? "eloStandard" : mode === "pauper" ? "eloPauper" : "eloRoyal";
+  const p1EloBefore = sender[eloField];
+  const p2EloBefore = receiver[eloField];
+  const p1GamesPlayed = sender[gamesField];
+  const p2GamesPlayed = receiver[gamesField];
+
+  // ── Compute combined FEN ────────────────────────────────────────────────────
+  let gameFen: string | undefined = undefined;
+  let whiteDraftFen = "";
+  let blackDraftFen = "";
+
+  if (challenge.senderDraftId && acceptorDraftId) {
+    const [senderDraft, acceptorDraft] = await Promise.all([
+      prisma.draft.findUnique({ where: { id: challenge.senderDraftId }, select: { fen: true } }),
+      prisma.draft.findUnique({ where: { id: acceptorDraftId },         select: { fen: true } }),
+    ]);
+    if (senderDraft?.fen && acceptorDraft?.fen) {
+      whiteDraftFen = senderIsWhite ? senderDraft.fen : acceptorDraft.fen;
+      blackDraftFen = senderIsWhite ? acceptorDraft.fen : senderDraft.fen;
+      gameFen       = buildCombinedDraftFen(whiteDraftFen, blackDraftFen);
+    }
+  }
+
+  const now = new Date();
+
+  // ── Atomic Postgres write + double-accept guard ───────────────────────────
+  // The transaction throws a sentinel error if another request already
+  // accepted the challenge. We let it propagate and catch it below rather
+  // than using .catch() on the transaction — that would widen the return
+  // type and cause a destructuring type error.
+  let game: { id: number };
+
+  try {
+    game = await prisma.$transaction(async (tx) => {
+      const guard = await tx.gameChallenge.updateMany({
+        where: { id: challengeId, status: "pending" },
+        data:  { status: "accepted" },
+      });
+
+      if (guard.count === 0) {
+        throw new Error("ALREADY_ACCEPTED");
+      }
+
+      return tx.game.create({
+        data: {
+          player1Id:        challenge.senderId,
+          player2Id:        userId,
+          whitePlayerId,
+          mode,
+          status:           "prep",
+          isFriendGame:     true,
+          draft1Id:         challenge.senderDraftId ?? null,
+          draft2Id:         acceptorDraftId ?? null,
+          fen:              gameFen,
+          prepStartedAt:    now,
+          auxPointsPlayer1: auxPoints,
+          auxPointsPlayer2: auxPoints,
+          player1EloBefore: p1EloBefore,
+          player2EloBefore: p2EloBefore,
+        },
+        select: { id: true },
+      });
+    });
+  } catch (err: any) {
+    if (err.message === "ALREADY_ACCEPTED") {
+      return NextResponse.json({ error: "Challenge is no longer pending" }, { status: 409 });
+    }
+    throw err;
+  }
+
+  // ── Seed Redis game hash immediately ──────────────────────────────────────────
+  // This ensures all subsequent prep operations (place, ready, status) hit Redis
+  // on first request rather than cold-starting through the Postgres fallback.
+  try {
+    const redis = await getRedisClient();
+    await seedGameState(redis as any, {
+      gameId:        game.id,
+      player1Id:     challenge.senderId,
+      player2Id:     userId,
+      whitePlayerId,
+      mode,
+      isFriendGame:  true,
+      fen:           gameFen ?? "8/8/8/8/8/8/8/4K3 w - - 0 1",
+      prepStartedAt: now.getTime(),
+      auxPointsPlayer1: auxPoints,
+      auxPointsPlayer2: auxPoints,
+      player1Timebank:  60_000,
+      player2Timebank:  60_000,
+      draft1Fen:        whiteDraftFen,
+      draft2Fen:        blackDraftFen,
+      player1EloBefore:   p1EloBefore,
+      player2EloBefore:   p2EloBefore,
+      player1GamesPlayed: p1GamesPlayed,
+      player2GamesPlayed: p2GamesPlayed,
+    });
+  } catch (err) {
+    // Non-fatal: the Postgres fallback in loadGameState will reseed on first
+    // request. Log and continue so the game is not blocked by a Redis blip.
+    console.error("[challenges] failed to seed Redis game hash", err);
+  }
+
+  // Notify challenger via their personal socket room
   await publishGameUpdate(game.id, {
-    status:      "prep",
+    status:       "prep",
     isFriendGame: true,
-    player1Id:   challenge.senderId,
-    player2Id:   userId,
+    player1Id:    challenge.senderId,
+    player2Id:    userId,
   });
 
-  // Also push directly to the challenger's queue-user room
-  const { getRedisClient } = await import("@/app/lib/redis-publisher");
   const redis = await getRedisClient();
   await redis.publish("draftchess:game-events", JSON.stringify({
     type:    "queue-user",

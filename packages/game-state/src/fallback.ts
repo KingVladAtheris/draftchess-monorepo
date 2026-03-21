@@ -20,8 +20,8 @@ import type { GameMode }        from '@draftchess/shared'
 import type { RedisClientType } from 'redis'
 import { logger }               from '@draftchess/logger'
 
-import { seedGameState, getGameState, updateGameState } from './client.js'
-import type { GameState, SeedGameStatePayload }         from './types.js'
+import { seedGameState, getGameState, updateGameState } from './client'
+import type { GameState, SeedGameStatePayload }         from './types'
 
 const log = logger.child({ module: 'game-state:fallback' })
 

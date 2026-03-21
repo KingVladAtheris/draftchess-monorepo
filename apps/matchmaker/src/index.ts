@@ -20,6 +20,7 @@ import { createReconcileWorker }      from './workers/reconcile.js'
 import { startForfeitSubscriber }     from './lib/forfeit-subscriber.js'
 import { startGameEndedSubscriber }   from './lib/game-ended-subscriber.js'
 import { startGameStartedSubscriber } from './lib/game-started-subscriber.js'
+import { startQueueJoinSubscriber }   from './lib/queue-join-subscriber.js'
 import {
   matchQueue,
   prepQueue,
@@ -73,9 +74,10 @@ async function main(): Promise<void> {
   await startForfeitSubscriber(REDIS_URL, publisher)
   await startGameEndedSubscriber(REDIS_URL, publisher)
   await startGameStartedSubscriber(REDIS_URL)
+  await startQueueJoinSubscriber(REDIS_URL)
 
   log.info('workers started (match, prep, timeout, reconcile)')
-  log.info('subscribers started (forfeit, game-ended, game-started)')
+  log.info('subscribers started (forfeit, game-ended, game-started, queue-join)')
 
   // ── Seed try-match if players are already waiting ────────────────────────────
   const queuedCount = await prisma.user.count({ where: { queueStatus: 'queued' } })

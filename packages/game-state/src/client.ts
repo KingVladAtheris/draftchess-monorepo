@@ -14,14 +14,14 @@ import {
   deserialize,
   serializeSeed,
   serializeUpdate,
-} from './serialization.js'
+} from './serialization'
 import {
   MOVE_SCRIPT,
   PLACE_SCRIPT,
   READY_SCRIPT,
   DRAW_OFFER_SCRIPT,
   FINISH_SCRIPT,
-} from './lua.js'
+} from './lua'
 import type {
   GameState,
   SeedGameStatePayload,
@@ -29,7 +29,7 @@ import type {
   LuaMoveResult,
   LuaPlaceResult,
   LuaReadyResult,
-} from './types.js'
+} from './types'
 
 // ── Key helpers ───────────────────────────────────────────────────────────────
 

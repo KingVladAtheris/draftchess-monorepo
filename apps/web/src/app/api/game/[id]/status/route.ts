@@ -1,13 +1,24 @@
 // apps/web/src/app/api/game/[id]/status/route.ts
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/auth";
-import { prisma } from "@draftchess/db";
+//
+// Returns the current game state for the requesting player.
+// Reads from Redis (fast path) with Postgres fallback via loadGameState.
+// For finished games (not in Redis), reads from Postgres directly.
+// Applies FEN masking during prep so neither player sees the other's aux pieces.
+
+import { NextRequest, NextResponse }   from "next/server";
+import { auth }                        from "@/auth";
+import { prisma }                      from "@draftchess/db";
+import { loadGameState }               from "@draftchess/game-state";
 import {
   buildCombinedDraftFen,
   maskOpponentAuxPlacements,
 } from "@draftchess/shared/fen-utils";
+import { getRedisClient }              from "@/app/lib/redis-publisher";
+import { logger }                      from "@draftchess/logger";
 
-const MOVE_TIME_LIMIT = 30000; // 30 seconds in ms
+const log = logger.child({ module: "web:status-route" });
+
+const MOVE_TIME_LIMIT = 30_000;
 
 export async function GET(
   req: NextRequest,
@@ -18,35 +29,111 @@ export async function GET(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const { id } = await params;
-  const userId = parseInt(session.user.id);
-  const gameId = parseInt(id);
+  const { id }  = await params;
+  const userId  = parseInt(session.user.id);
+  const gameId  = parseInt(id);
 
+  const redis = await getRedisClient();
+
+  // ── Try Redis first ─────────────────────────────────────────────────────
+  const state = await loadGameState(redis, gameId);
+
+  // ── Finished game — read from Postgres ──────────────────────────────────
+  // Finished games are not cached in Redis. Read the final state directly.
+  if (state === "finished") {
+    return getFinishedGameStatus(gameId, userId);
+  }
+
+  // ── Game not found ──────────────────────────────────────────────────────
+  if (!state) {
+    return NextResponse.json({ error: "Game not found" }, { status: 404 });
+  }
+
+  // ── Participant check ───────────────────────────────────────────────────
+  if (state.player1Id !== userId && state.player2Id !== userId) {
+    return NextResponse.json({ error: "You are not a participant in this game" }, { status: 403 });
+  }
+
+  const isWhite   = state.whitePlayerId === userId;
+  const isPlayer1 = state.player1Id === userId;
+
+  // ── FEN masking during prep ─────────────────────────────────────────────
+  let fen = state.fen;
+  if (state.status === "prep" && state.draft1Fen && state.draft2Fen) {
+    const originalFen = buildCombinedDraftFen(state.draft1Fen, state.draft2Fen);
+    fen = maskOpponentAuxPlacements(state.fen, originalFen, isWhite);
+  }
+
+  // ── Timer calculation ───────────────────────────────────────────────────
+  let timeRemainingOnMove   = MOVE_TIME_LIMIT;
+  let isMyTurn              = false;
+  let currentPlayerTimebank: number | null = null;
+
+  if (state.status === "active" && state.lastMoveAt > 0) {
+    const fenTurn = fen.split(" ")[1];
+    isMyTurn = (fenTurn === "w" && isWhite) || (fenTurn === "b" && !isWhite);
+
+    const elapsed = Date.now() - state.lastMoveAt;
+    if (isMyTurn) {
+      timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed);
+      const myTimebank    = isPlayer1 ? state.player1Timebank : state.player2Timebank;
+      currentPlayerTimebank = elapsed > MOVE_TIME_LIMIT
+        ? Math.max(0, myTimebank - (elapsed - MOVE_TIME_LIMIT))
+        : myTimebank;
+    }
+  }
+
+  return NextResponse.json({
+    fen,
+    status:        state.status,
+    prepStartedAt: state.prepStartedAt > 0 ? new Date(state.prepStartedAt).toISOString() : null,
+    readyPlayer1:  state.readyPlayer1,
+    readyPlayer2:  state.readyPlayer2,
+    auxPointsPlayer1: state.auxPointsPlayer1,
+    auxPointsPlayer2: state.auxPointsPlayer2,
+    player1Id:     state.player1Id,
+    player2Id:     state.player2Id,
+    isWhite,
+    moveNumber:    state.moveNumber,
+    player1Timebank: state.player1Timebank,
+    player2Timebank: state.player2Timebank,
+    lastMoveAt:    state.lastMoveAt > 0 ? new Date(state.lastMoveAt).toISOString() : null,
+    lastMoveBy:    state.lastMoveBy > 0 ? state.lastMoveBy : null,
+    isMyTurn,
+    timeRemainingOnMove,
+    currentPlayerTimebank,
+    // Not available from Redis for active games — null until finished
+    winnerId:        null,
+    endReason:       null,
+    player1EloAfter: null,
+    player2EloAfter: null,
+    eloChange:       null,
+  });
+}
+
+// ── Finished game path — reads from Postgres ─────────────────────────────────
+async function getFinishedGameStatus(
+  gameId: number,
+  userId: number,
+): Promise<NextResponse> {
   const game = await prisma.game.findUnique({
-    where: { id: gameId },
+    where:  { id: gameId },
     select: {
-      fen: true,
-      status: true,
-      prepStartedAt: true,
-      readyPlayer1: true,
-      readyPlayer2: true,
-      auxPointsPlayer1: true,
-      auxPointsPlayer2: true,
-      player1Id: true,
-      player2Id: true,
-      whitePlayerId: true,
-      draft1: { select: { fen: true } },
-      draft2: { select: { fen: true } },
-      lastMoveAt: true,
-      lastMoveBy: true,
-      moveNumber: true,
+      status:          true,
+      fen:             true,
+      player1Id:       true,
+      player2Id:       true,
+      whitePlayerId:   true,
+      moveNumber:      true,
       player1Timebank: true,
       player2Timebank: true,
-      winnerId: true,
-      endReason: true,
+      lastMoveAt:      true,
+      lastMoveBy:      true,
+      winnerId:        true,
+      endReason:       true,
       player1EloAfter: true,
       player2EloAfter: true,
-      eloChange: true,
+      eloChange:       true,
     },
   });
 
@@ -58,86 +145,32 @@ export async function GET(
     return NextResponse.json({ error: "You are not a participant in this game" }, { status: 403 });
   }
 
-  // isWhite derived from whitePlayerId — player1/player2 are queue slots, not colors
-  const isWhite = game.whitePlayerId === userId;
+  const isWhite   = game.whitePlayerId === userId;
   const isPlayer1 = game.player1Id === userId;
-  const currentFen = game.fen ?? "";
-
-  // ─── FEN masking during prep ──────────────────────────────────────────────
-  // During prep, each player can only see their own aux placements.
-  // Once the game is active, the full FEN is revealed to both.
-  let fen = currentFen;
-  let originalDraftFen: string | null = null;
-
-  if (game.status === "prep" && game.draft1?.fen && game.draft2?.fen) {
-    originalDraftFen = buildCombinedDraftFen(game.draft1.fen, game.draft2.fen);
-    fen = maskOpponentAuxPlacements(currentFen, originalDraftFen, isWhite);
-  }
-
-  // ─── Timer calculation ────────────────────────────────────────────────────
-  let timeRemainingOnMove = MOVE_TIME_LIMIT;
-  let isMyTurn = false;
-  let currentPlayerTimebank: number | null = null;
-
-  if (game.status === "active") {
-    // Derive turn from FEN — server authoritative
-    const turn = currentFen.split(" ")[1]; // "w" or "b"
-    isMyTurn = (turn === "w" && isWhite) || (turn === "b" && !isWhite);
-
-    if (game.lastMoveAt) {
-      const now = new Date();
-      const elapsed = now.getTime() - new Date(game.lastMoveAt).getTime();
-
-      if (isMyTurn) {
-        timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed);
-
-        // Calculate timebank remaining for the current player
-        const myTimebank = isPlayer1 ? game.player1Timebank : game.player2Timebank;
-        if (elapsed > MOVE_TIME_LIMIT) {
-          currentPlayerTimebank = Math.max(0, myTimebank - (elapsed - MOVE_TIME_LIMIT));
-        } else {
-          currentPlayerTimebank = myTimebank;
-        }
-      }
-    }
-  }
 
   return NextResponse.json({
-    // Position — masked during prep for opponent's aux pieces
-    fen,
-
-    // Game metadata
-    status: game.status,
-    prepStartedAt: game.prepStartedAt,
-    readyPlayer1: game.readyPlayer1,
-    readyPlayer2: game.readyPlayer2,
-
-    // Points
-    auxPointsPlayer1: game.auxPointsPlayer1,
-    auxPointsPlayer2: game.auxPointsPlayer2,
-
-    // Players
-    player1Id: game.player1Id,
-    player2Id: game.player2Id,
+    fen:           game.fen ?? "",
+    status:        game.status,
+    prepStartedAt: null,
+    readyPlayer1:  true,
+    readyPlayer2:  true,
+    auxPointsPlayer1: 0,
+    auxPointsPlayer2: 0,
+    player1Id:     game.player1Id,
+    player2Id:     game.player2Id,
     isWhite,
-
-    // Move & time state
-    moveNumber: game.moveNumber,
+    moveNumber:    game.moveNumber,
     player1Timebank: game.player1Timebank,
     player2Timebank: game.player2Timebank,
-    lastMoveAt: game.lastMoveAt,
-    lastMoveBy: game.lastMoveBy,
-
-    // Computed from server — clients use these as authoritative source
-    isMyTurn,
-    timeRemainingOnMove,
-    currentPlayerTimebank,
-
-    // Game result (null until finished)
-    winnerId: game.winnerId,
-    endReason: game.endReason,
-    player1EloAfter: game.player1EloAfter,
-    player2EloAfter: game.player2EloAfter,
-    eloChange: game.eloChange,
+    lastMoveAt:    game.lastMoveAt?.toISOString() ?? null,
+    lastMoveBy:    game.lastMoveBy ?? null,
+    isMyTurn:      false,
+    timeRemainingOnMove: 0,
+    currentPlayerTimebank: null,
+    winnerId:        game.winnerId ?? null,
+    endReason:       game.endReason ?? null,
+    player1EloAfter: game.player1EloAfter ?? null,
+    player2EloAfter: game.player2EloAfter ?? null,
+    eloChange:       game.eloChange ?? null,
   });
 }

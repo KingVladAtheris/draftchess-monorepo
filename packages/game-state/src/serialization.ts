@@ -14,7 +14,7 @@
 // deserialize() never returns undefined fields — missing fields get defaults.
 
 import type { GameMode }      from '@draftchess/shared'
-import type { GameState, RawGameHash, SeedGameStatePayload } from './types.js'
+import type { GameState, RawGameHash, SeedGameStatePayload } from './types'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
