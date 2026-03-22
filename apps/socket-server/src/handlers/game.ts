@@ -1,11 +1,10 @@
 // apps/socket-server/src/handlers/game.ts
 //
-// FIX: loadGameState was called 3 times per join-game on finished games:
-//   1. Initial load for participant check
-//   2. sendSnapshot calling loadGameState again
-//   3. sendFinishedSnapshot hitting Postgres
-// Now the state is loaded once and threaded through to sendSnapshot,
-// eliminating the repeated Postgres fallback calls on finished games.
+// CHANGE: join-game now supports spectators.
+// Non-participants can join the game-{gameId} room to receive live updates.
+// Spectators are NOT added to game-{gameId}-user-{userId} rooms (those are
+// for targeted participant-only messages like opponent-disconnected).
+// Spectators receive game-snapshot with prep-masked FEN (no aux placements).
 
 import { prisma }                                            from '@draftchess/db'
 import { loadGameState }                                     from '@draftchess/game-state'
@@ -34,7 +33,6 @@ export function registerGameHandlers(io: IO, socket: Sock, redis: any): void {
     if (!gameId || typeof gameId !== 'number') return
 
     try {
-      // Load state once — reuse for participant check, room join, and snapshot.
       const state = await loadGameState(redis, gameId)
 
       if (!state) {
@@ -42,13 +40,11 @@ export function registerGameHandlers(io: IO, socket: Sock, redis: any): void {
         return
       }
 
-      // ── Participant check ──────────────────────────────────────────────────
       let player1Id: number
       let player2Id: number
       let gameStatus: string
 
       if (state === 'finished') {
-        // Hash deleted — must check Postgres for player IDs
         const pg = await prisma.game.findUnique({
           where:  { id: gameId },
           select: { player1Id: true, player2Id: true, status: true },
@@ -66,26 +62,27 @@ export function registerGameHandlers(io: IO, socket: Sock, redis: any): void {
         gameStatus = state.status
       }
 
-      if (player1Id !== userId && player2Id !== userId) {
-        log.warn({ gameId, userId }, 'join-game: user is not a participant')
-        return
-      }
+      const isParticipant = player1Id === userId || player2Id === userId
 
+      // All users (participants and spectators) join the broadcast room
       socket.join(`game-${gameId}`)
-      socket.join(`game-${gameId}-user-${userId}`)
       socket.data.gameId = gameId
 
-      await clearDisconnectedPresence(redis, userId, gameId)
+      if (isParticipant) {
+        // Participants also join their personal game room for targeted messages
+        socket.join(`game-${gameId}-user-${userId}`)
 
-      if (gameStatus === 'active' || gameStatus === 'prep') {
-        const opponentId = player1Id === userId ? player2Id : player1Id
-        io.to(`game-${gameId}-user-${opponentId}`).emit('opponent-connected', { userId })
+        await clearDisconnectedPresence(redis, userId, gameId)
+
+        if (gameStatus === 'active' || gameStatus === 'prep') {
+          const opponentId = player1Id === userId ? player2Id : player1Id
+          io.to(`game-${gameId}-user-${opponentId}`).emit('opponent-connected', { userId })
+        }
       }
 
-      // Pass the already-loaded state through so sendSnapshot doesn't reload it
-      await sendSnapshot(socket, redis, gameId, userId, state)
+      await sendSnapshot(socket, redis, gameId, userId, state, isParticipant)
 
-      log.info({ gameId, userId }, 'user joined game')
+      log.info({ gameId, userId, isParticipant }, 'user joined game')
 
     } catch (err) {
       log.error({ gameId, userId, err }, 'join-game error')
@@ -94,12 +91,12 @@ export function registerGameHandlers(io: IO, socket: Sock, redis: any): void {
 }
 
 async function sendSnapshot(
-  socket: Sock,
-  redis:  any,
-  gameId: number,
-  userId: number,
-  // Accept the already-loaded state so we don't call loadGameState again
-  state: Awaited<ReturnType<typeof loadGameState>>,
+  socket:        Sock,
+  redis:         any,
+  gameId:        number,
+  userId:        number,
+  state:         Awaited<ReturnType<typeof loadGameState>>,
+  isParticipant: boolean,
 ): Promise<void> {
   try {
     if (!state) {
@@ -115,19 +112,24 @@ async function sendSnapshot(
     const isWhite = state.whitePlayerId === userId
     let maskedFen = state.fen
 
-    if (state.status === 'prep' && state.draft1Fen && state.draft2Fen) {
-      const originalFen = buildCombinedDraftFen(state.draft1Fen, state.draft2Fen)
-      maskedFen = maskOpponentAuxPlacements(state.fen, originalFen, isWhite)
-    } else if (state.status === 'prep') {
-      log.warn({ gameId }, 'snapshot: draft FEN missing during prep')
+    if (state.status === 'prep') {
+      if (isParticipant && state.draft1Fen && state.draft2Fen) {
+        // Participants see their own placements but not the opponent's
+        const originalFen = buildCombinedDraftFen(state.draft1Fen, state.draft2Fen)
+        maskedFen = maskOpponentAuxPlacements(state.fen, originalFen, isWhite)
+      } else if (!isParticipant && state.draft1Fen && state.draft2Fen) {
+        // Spectators see only the original draft FEN — no aux placements at all
+        maskedFen = buildCombinedDraftFen(state.draft1Fen, state.draft2Fen)
+      }
     }
 
     let timeRemainingOnMove = MOVE_TIME_LIMIT
     if (state.status === 'active' && state.lastMoveAt > 0) {
       const fenTurn = state.fen.split(' ')[1]
-      const myTurn  = (fenTurn === 'w' && isWhite) || (fenTurn === 'b' && !isWhite)
+      const myTurn  = isParticipant && ((fenTurn === 'w' && isWhite) || (fenTurn === 'b' && !isWhite))
       const elapsed = Date.now() - state.lastMoveAt
       if (myTurn) timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed)
+      else if (!isParticipant) timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed)
     }
 
     socket.emit('game-snapshot', {
@@ -138,8 +140,8 @@ async function sendSnapshot(
         : null,
       readyPlayer1:     state.readyPlayer1,
       readyPlayer2:     state.readyPlayer2,
-      auxPointsPlayer1: state.auxPointsPlayer1,
-      auxPointsPlayer2: state.auxPointsPlayer2,
+      auxPointsPlayer1: isParticipant ? state.auxPointsPlayer1 : 0,
+      auxPointsPlayer2: isParticipant ? state.auxPointsPlayer2 : 0,
       moveNumber:       state.moveNumber,
       player1Timebank:  state.player1Timebank,
       player2Timebank:  state.player2Timebank,

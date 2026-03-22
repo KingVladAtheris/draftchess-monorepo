@@ -1,5 +1,11 @@
 "use client";
 // apps/web/src/app/profile/[username]/ProfileClient.tsx
+//
+// CHANGES:
+// 1. Added LiveGame type and liveGame prop
+// 2. Added LiveGameSection component
+// 3. Rendered <LiveGameSection> in OverviewTab above recent games
+// 4. GameRow already has Replay → link — no change needed there
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
@@ -32,6 +38,16 @@ type Game = {
   eloBefore: number | null; eloAfter: number | null; eloChange: number | null;
 };
 
+// ── NEW ──────────────────────────────────────────────────────────────────────
+type LiveGame = {
+  id:      number;
+  status:  string;
+  mode:    string;
+  player1: { id: number; username: string };
+  player2: { id: number; username: string };
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 type EloPoint = { date: string; elo: number };
 
 type FriendStatus = "none" | "pending_sent" | "pending_received" | "friends";
@@ -40,6 +56,7 @@ type Props = {
   profile: Profile;
   games: Game[];
   eloHistory: { standard: EloPoint[]; pauper: EloPoint[]; royal: EloPoint[] };
+  liveGame: LiveGame | null; // ── NEW
   isOwnProfile: boolean;
   isFollowing: boolean;
   friendStatus: FriendStatus;
@@ -138,7 +155,6 @@ function EloChart({ points, color, mode }: { points: EloPoint[]; color: string; 
             <stop offset="100%" stopColor={color} stopOpacity="0.02" />
           </linearGradient>
         </defs>
-        {/* Grid lines */}
         {yTicks.map((tick, i) => {
           const y = pad.t + ih - ((tick - min) / range) * ih;
           return (
@@ -150,11 +166,8 @@ function EloChart({ points, color, mode }: { points: EloPoint[]; color: string; 
             </g>
           );
         })}
-        {/* Area fill */}
         <path d={fill} fill={`url(#chart-grad-${mode})`} />
-        {/* Line */}
         <path d={d} fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-        {/* End dot */}
         <circle cx={xs[xs.length-1]} cy={ys[ys.length-1]} r="3.5" fill={color} />
         <circle cx={xs[xs.length-1]} cy={ys[ys.length-1]} r="6" fill={color} fillOpacity="0.2" />
       </svg>
@@ -174,7 +187,6 @@ function TokenBadge({ token, size = "sm" }: { token: Token; size?: "sm" | "lg" }
         >
           {token.icon ?? "🏅"}
         </div>
-        {/* Tooltip */}
         <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-2 py-1 rounded-md bg-[#1a1d2e] border border-white/10 text-xs text-white/80 whitespace-nowrap opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none z-10 shadow-xl">
           {token.label}
         </div>
@@ -201,8 +213,8 @@ function TokenBadge({ token, size = "sm" }: { token: Token; size?: "sm" | "lg" }
 
 // ─── Stat Bar ──────────────────────────────────────────────────────────────
 function StatBar({ stats, mode }: { stats: ModeStats; mode: GameMode }) {
-  const total = stats.played;
-  const wr    = winRate(stats);
+  const total    = stats.played;
+  const wr       = winRate(stats);
   const winPct   = total ? (stats.wins   / total) * 100 : 0;
   const lossPct  = total ? (stats.losses / total) * 100 : 0;
   const drawPct  = total ? (stats.draws  / total) * 100 : 0;
@@ -249,15 +261,77 @@ function GameRow({ game }: { game: Game }) {
       <span className="text-xs text-white/30 flex-shrink-0">{game.endReason?.replace("_", " ") ?? ""}</span>
       <span className={`text-sm font-semibold w-12 text-right flex-shrink-0 ${eloColor}`}>{eloStr}</span>
       <span className="text-xs text-white/25 flex-shrink-0 w-16 text-right">{timeAgo(game.createdAt)}</span>
-      <Link href={`/game/${game.id}/replay`} className="text-xs text-amber-400/60 hover:text-amber-400 transition-colors flex-shrink-0">
+      <Link
+        href={`/play/game/${game.id}/replay`}
+        className="text-xs text-amber-400/60 hover:text-amber-400 transition-colors flex-shrink-0"
+      >
         Replay →
       </Link>
     </div>
   );
 }
 
+// ── NEW: Live Game Section ─────────────────────────────────────────────────
+function LiveGameSection({ liveGame }: { liveGame: LiveGame | null }) {
+  if (!liveGame) return null;
+
+  const modeLabel = (MODE_LABEL as Record<string, string>)[liveGame.mode] ?? liveGame.mode;
+  const modeColor =
+    liveGame.mode === "royal"  ? "text-violet-400 bg-violet-400/10 border-violet-400/20" :
+    liveGame.mode === "pauper" ? "text-sky-400 bg-sky-400/10 border-sky-400/20" :
+                                  "text-amber-400 bg-amber-400/10 border-amber-400/20";
+
+  return (
+    <div className="mb-6">
+      <div className="flex items-center gap-2 mb-3">
+        <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+        <p className="text-xs font-bold uppercase tracking-widest text-red-400">Playing right now</p>
+      </div>
+
+      <div className="flex items-center gap-3 py-3 px-4 rounded-xl border border-red-500/15 bg-red-500/[0.04] hover:bg-red-500/[0.07] transition-colors">
+        {/* Mode badge */}
+        <span className={`text-xs px-2 py-0.5 rounded-md border font-medium flex-shrink-0 ${modeColor}`}>
+          {modeLabel}
+        </span>
+
+        {/* Players */}
+        <div className="flex-1 flex items-center gap-1.5 text-sm text-white/70 min-w-0">
+          <Link href={`/profile/${liveGame.player1.username}`} className="font-medium hover:text-white transition-colors truncate">
+            {liveGame.player1.username}
+          </Link>
+          <span className="text-white/25 flex-shrink-0">vs</span>
+          <Link href={`/profile/${liveGame.player2.username}`} className="font-medium hover:text-white transition-colors truncate">
+            {liveGame.player2.username}
+          </Link>
+        </div>
+
+        {/* Live badge */}
+        <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-red-500/15 border border-red-500/25 flex-shrink-0">
+          <div className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+          <span className="text-xs font-bold text-red-400">Live</span>
+        </div>
+
+        {/* Watch link */}
+        <Link
+          href={`/play/game/${liveGame.id}/watch`}
+          className="text-xs text-white/40 hover:text-white/70 transition-colors flex-shrink-0 flex items-center gap-1"
+        >
+          Watch →
+        </Link>
+      </div>
+    </div>
+  );
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ─── Tab: Overview ─────────────────────────────────────────────────────────
-function OverviewTab({ profile, games, eloHistory }: { profile: Profile; games: Game[]; eloHistory: Props["eloHistory"] }) {
+// ── CHANGED: accepts liveGame and passes to LiveGameSection ──────────────────
+function OverviewTab({ profile, games, eloHistory, liveGame }: {
+  profile: Profile;
+  games: Game[];
+  eloHistory: Props["eloHistory"];
+  liveGame: LiveGame | null; // ── NEW
+}) {
   const modes: GameMode[] = ["standard", "pauper", "royal"];
   return (
     <div className="space-y-8">
@@ -286,6 +360,9 @@ function OverviewTab({ profile, games, eloHistory }: { profile: Profile; games: 
           </div>
         </div>
       )}
+
+      {/* ── NEW: Live game above recent games ────────────────────────────── */}
+      <LiveGameSection liveGame={liveGame} />
 
       {/* Recent games */}
       <div>
@@ -348,10 +425,10 @@ function StatsTab({ profile, eloHistory }: { profile: Profile; eloHistory: Props
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         {[
-          { label: "ELO",     value: profile.elo[activeMode] },
-          { label: "Games",   value: profile.stats[activeMode].played },
-          { label: "Win rate",value: `${winRate(profile.stats[activeMode])}%` },
-          { label: "Wins",    value: profile.stats[activeMode].wins },
+          { label: "ELO",      value: profile.elo[activeMode] },
+          { label: "Games",    value: profile.stats[activeMode].played },
+          { label: "Win rate", value: `${winRate(profile.stats[activeMode])}%` },
+          { label: "Wins",     value: profile.stats[activeMode].wins },
         ].map(s => (
           <div key={s.label} className="rounded-xl border border-white/8 bg-white/[0.02] p-4">
             <p className="text-xs text-white/35 uppercase tracking-wider mb-1">{s.label}</p>
@@ -377,13 +454,8 @@ function StatsTab({ profile, eloHistory }: { profile: Profile; eloHistory: Props
 
 // ─── Shared: Social user row ───────────────────────────────────────────────
 type SocialUser = {
-  id: number;
-  username: string;
-  image: string | null;
-  eloStandard: number;
-  eloPauper: number;
-  eloRoyal: number;
-  online: boolean;
+  id: number; username: string; image: string | null;
+  eloStandard: number; eloPauper: number; eloRoyal: number; online: boolean;
 };
 
 function SocialUserRow({ user }: { user: SocialUser }) {
@@ -392,7 +464,6 @@ function SocialUserRow({ user }: { user: SocialUser }) {
       href={`/profile/${user.username}`}
       className="flex items-center gap-3 px-4 py-3 rounded-xl border border-white/6 bg-white/[0.02] hover:bg-white/[0.05] hover:border-white/12 transition-all group"
     >
-      {/* Avatar + online dot */}
       <div className="relative flex-shrink-0">
         <div className="w-9 h-9 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400 text-sm font-bold">
           {user.image
@@ -402,18 +473,10 @@ function SocialUserRow({ user }: { user: SocialUser }) {
         </div>
         <span className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-[#0f1117] ${user.online ? "bg-emerald-400" : "bg-white/20"}`} />
       </div>
-
-      {/* Name */}
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-semibold text-white/80 group-hover:text-white transition-colors truncate">
-          {user.username}
-        </p>
-        <p className="text-[11px] text-white/30 mt-0.5">
-          {user.online ? "Online" : "Offline"} · {user.eloStandard} ELO
-        </p>
+        <p className="text-sm font-semibold text-white/80 group-hover:text-white transition-colors truncate">{user.username}</p>
+        <p className="text-[11px] text-white/30 mt-0.5">{user.online ? "Online" : "Offline"} · {user.eloStandard} ELO</p>
       </div>
-
-      {/* ELO chips */}
       <div className="hidden sm:flex items-center gap-1.5 flex-shrink-0">
         {[
           { label: "S", elo: user.eloStandard },
@@ -433,13 +496,11 @@ function SocialUserRow({ user }: { user: SocialUser }) {
 function useSocialList(url: string) {
   const [users, setUsers]     = useState<SocialUser[]>([]);
   const [loading, setLoading] = useState(true);
-
   useEffect(() => {
     fetch(url)
       .then(r => r.json())
       .then(data => {
         const list: SocialUser[] = data.friends ?? data.following ?? [];
-        // Sort: online first, then alphabetically within each group
         list.sort((a, b) => {
           if (a.online !== b.online) return a.online ? -1 : 1;
           return a.username.localeCompare(b.username);
@@ -449,100 +510,46 @@ function useSocialList(url: string) {
       .catch(() => {})
       .finally(() => setLoading(false));
   }, [url]);
-
   return { users, loading };
 }
 
 // ─── Tab: Friends ──────────────────────────────────────────────────────────
 function FriendsTab({ isOwnProfile }: { isOwnProfile: boolean }) {
   const { users, loading } = useSocialList("/api/friends");
-
-  if (!isOwnProfile) {
-    return (
-      <p className="text-white/30 text-sm py-8 text-center">
-        Friends list is only visible to the account owner.
-      </p>
-    );
-  }
-
-  if (loading) {
-    return (
-      <div className="space-y-2">
-        {[1,2,3].map(i => (
-          <div key={i} className="h-16 rounded-xl bg-white/[0.03] animate-pulse" />
-        ))}
-      </div>
-    );
-  }
-
-  if (users.length === 0) {
-    return <p className="text-white/25 text-sm py-8 text-center">No friends yet.</p>;
-  }
-
+  if (!isOwnProfile) return <p className="text-white/30 text-sm py-8 text-center">Friends list is only visible to the account owner.</p>;
+  if (loading) return <div className="space-y-2">{[1,2,3].map(i => <div key={i} className="h-16 rounded-xl bg-white/[0.03] animate-pulse" />)}</div>;
+  if (users.length === 0) return <p className="text-white/25 text-sm py-8 text-center">No friends yet.</p>;
   const online = users.filter(u => u.online);
-
   return (
     <div className="space-y-4">
-      <p className="text-xs text-white/30 font-medium">
-        {users.length} friend{users.length !== 1 ? "s" : ""} · {online.length} online
-      </p>
-      <div className="space-y-2">
-        {users.map(u => <SocialUserRow key={u.id} user={u} />)}
-      </div>
+      <p className="text-xs text-white/30 font-medium">{users.length} friend{users.length !== 1 ? "s" : ""} · {online.length} online</p>
+      <div className="space-y-2">{users.map(u => <SocialUserRow key={u.id} user={u} />)}</div>
     </div>
   );
 }
 
 // ─── Tab: Following ────────────────────────────────────────────────────────
 function FollowingTab({ username, isOwnProfile }: { username: string; isOwnProfile: boolean }) {
-  // Own profile → use /api/following (returns own list with online status from Redis)
-  // Other profile → use public /api/profile/[username]/following
   const url = isOwnProfile ? "/api/following" : `/api/profile/${username}/following`;
   const { users, loading } = useSocialList(url);
-
-  if (loading) {
-    return (
-      <div className="space-y-2">
-        {[1,2,3].map(i => (
-          <div key={i} className="h-16 rounded-xl bg-white/[0.03] animate-pulse" />
-        ))}
-      </div>
-    );
-  }
-
-  if (users.length === 0) {
-    return <p className="text-white/25 text-sm py-8 text-center">
-      {isOwnProfile ? "You aren’t following anyone yet." : "Not following anyone."}
-    </p>;
-  }
-
+  if (loading) return <div className="space-y-2">{[1,2,3].map(i => <div key={i} className="h-16 rounded-xl bg-white/[0.03] animate-pulse" />)}</div>;
+  if (users.length === 0) return <p className="text-white/25 text-sm py-8 text-center">{isOwnProfile ? "You aren't following anyone yet." : "Not following anyone."}</p>;
   const online = users.filter(u => u.online);
-
   return (
     <div className="space-y-4">
-      <p className="text-xs text-white/30 font-medium">
-        {users.length} following · {online.length} online
-      </p>
-      <div className="space-y-2">
-        {users.map(u => <SocialUserRow key={u.id} user={u} />)}
-      </div>
+      <p className="text-xs text-white/30 font-medium">{users.length} following · {online.length} online</p>
+      <div className="space-y-2">{users.map(u => <SocialUserRow key={u.id} user={u} />)}</div>
     </div>
   );
 }
 
 // ─── Tab: Tokens ───────────────────────────────────────────────────────────
 function TokensTab({ tokens }: { tokens: Token[] }) {
-  if (tokens.length === 0) {
-    return <p className="text-white/30 text-sm py-8 text-center">No tokens yet.</p>;
-  }
-  return (
-    <div className="space-y-3">
-      {tokens.map(t => <TokenBadge key={t.slug} token={t} size="lg" />)}
-    </div>
-  );
+  if (tokens.length === 0) return <p className="text-white/30 text-sm py-8 text-center">No tokens yet.</p>;
+  return <div className="space-y-3">{tokens.map(t => <TokenBadge key={t.slug} token={t} size="lg" />)}</div>;
 }
 
-// ─── ChallengeDropdown ──────────────────────────────────────────────────────
+// ─── ChallengeDropdown ─────────────────────────────────────────────────────
 function ChallengeDropdown({
   profileId, challengeMode, challengeDraftId, challengeDrafts,
   challengeLoading, challengeSent,
@@ -572,41 +579,33 @@ function ChallengeDropdown({
   }, [open]);
 
   const handleToggle = () => {
-    if (!open) onOpen(challengeMode); // fetch drafts for current mode on first open
+    if (!open) onOpen(challengeMode);
     setOpen(o => !o);
   };
 
   return (
     <div ref={ref} className="relative">
-      <button
-        onClick={handleToggle}
-        className="px-4 py-2 rounded-xl text-sm font-semibold border border-purple-500/40 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 transition-all"
-      >
+      <button onClick={handleToggle} className="px-4 py-2 rounded-xl text-sm font-semibold border border-purple-500/40 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 transition-all">
         ⚔ Challenge
       </button>
       {open && (
         <div className="absolute right-0 top-[calc(100%+8px)] w-72 z-50 bg-[#1a1d2e] border border-white/10 rounded-xl shadow-2xl shadow-black/60 p-4 flex flex-col gap-3">
           <p className="text-xs font-bold uppercase tracking-wider text-white/40">Send Challenge</p>
           <p className="text-[11px] text-white/25">Casual game · no ELO impact</p>
-          {/* Mode picker */}
           <div className="flex gap-1.5">
             {(["standard", "pauper", "royal"] as GameMode[]).map(m => (
-              <button
-                key={m}
-                onClick={() => onModeChange(m)}
+              <button key={m} onClick={() => onModeChange(m)}
                 className={`flex-1 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
                   challengeMode === m
                     ? m === "royal"  ? "bg-purple-500/20 border-purple-500/40 text-purple-400"
                     : m === "pauper" ? "bg-sky-500/20 border-sky-500/40 text-sky-400"
                     :                  "bg-amber-500/20 border-amber-500/40 text-amber-400"
                     : "border-white/10 text-white/40 hover:border-white/20"
-                }`}
-              >
+                }`}>
                 {MODE_CONFIG[m].label}
               </button>
             ))}
           </div>
-          {/* Draft picker */}
           <div>
             <p className="text-[10px] text-white/35 mb-1.5">Your draft (optional)</p>
             <select
@@ -615,19 +614,14 @@ function ChallengeDropdown({
               className="w-full bg-[#0f1117] border border-white/10 rounded-lg px-3 py-2 text-sm text-white/70 focus:outline-none focus:border-white/25"
             >
               <option value="">— No draft selected —</option>
-              {challengeDrafts.map(d => (
-                <option key={d.id} value={d.id}>{d.name || `Draft #${d.id}`}</option>
-              ))}
+              {challengeDrafts.map(d => <option key={d.id} value={d.id}>{d.name || `Draft #${d.id}`}</option>)}
             </select>
           </div>
           {challengeSent ? (
             <p className="text-center text-emerald-400 text-sm font-semibold">✓ Challenge sent!</p>
           ) : (
-            <button
-              onClick={onSend}
-              disabled={challengeLoading}
-              className="w-full py-2 rounded-xl bg-purple-500/15 border border-purple-500/30 text-purple-400 text-sm font-semibold hover:bg-purple-500/25 transition-all disabled:opacity-50"
-            >
+            <button onClick={onSend} disabled={challengeLoading}
+              className="w-full py-2 rounded-xl bg-purple-500/15 border border-purple-500/30 text-purple-400 text-sm font-semibold hover:bg-purple-500/25 transition-all disabled:opacity-50">
               {challengeLoading ? "Sending…" : "Send Challenge"}
             </button>
           )}
@@ -640,15 +634,18 @@ function ChallengeDropdown({
 // ─── Main Component ────────────────────────────────────────────────────────
 type Tab = "overview" | "games" | "stats" | "friends" | "following" | "tokens";
 
-export default function ProfileClient({ profile, games, eloHistory, isOwnProfile, isFollowing, friendStatus: initialFriendStatus, friendRequestId: initialRequestId, viewerId }: Props) {
-  const [activeTab, setActiveTab]     = useState<Tab>("overview");
-  const [following, setFollowing]         = useState(isFollowing);
-  const [followLoading, setFollowLoading]   = useState(false);
-  const [friendStatus, setFriendStatus]     = useState<FriendStatus>(initialFriendStatus);
-  const [friendRequestId, setFriendRequestId] = useState<number | null>(initialRequestId);
-  const [friendLoading, setFriendLoading]   = useState(false);
-
-  // ── Challenge state ────────────────────────────────────────────────────────
+export default function ProfileClient({
+  profile, games, eloHistory,
+  liveGame,            // ── NEW
+  isOwnProfile, isFollowing, friendStatus: initialFriendStatus,
+  friendRequestId: initialRequestId, viewerId,
+}: Props) {
+  const [activeTab, setActiveTab]               = useState<Tab>("overview");
+  const [following, setFollowing]               = useState(isFollowing);
+  const [followLoading, setFollowLoading]       = useState(false);
+  const [friendStatus, setFriendStatus]         = useState<FriendStatus>(initialFriendStatus);
+  const [friendRequestId, setFriendRequestId]   = useState<number | null>(initialRequestId);
+  const [friendLoading, setFriendLoading]       = useState(false);
   const [challengeMode, setChallengeMode]       = useState<GameMode>("standard");
   const [challengeDraftId, setChallengeDraftId] = useState<number | null>(null);
   const [challengeDrafts, setChallengeDrafts]   = useState<{ id: number; name: string | null }[]>([]);
@@ -660,22 +657,19 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
     setFriendLoading(true);
     try {
       if (friendStatus === "friends" || friendStatus === "pending_sent") {
-        // Remove friend or cancel request
         if (friendRequestId) {
           const res = await apiFetch(`/api/friends/${friendRequestId}`, { method: "DELETE" });
           if (res.ok) { setFriendStatus("none"); setFriendRequestId(null); }
         }
       } else if (friendStatus === "pending_received") {
-        // Accept incoming request
         if (friendRequestId) {
           const res = await apiFetch(`/api/friends/${friendRequestId}`, {
             method: "PATCH", headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ action: "accept" }),
           });
-          if (res.ok) { setFriendStatus("friends"); }
+          if (res.ok) setFriendStatus("friends");
         }
       } else {
-        // Send request
         const res = await apiFetch("/api/friends/request", {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ targetUserId: profile.id }),
@@ -686,9 +680,7 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
           setFriendRequestId(data.requestId);
         }
       }
-    } finally {
-      setFriendLoading(false);
-    }
+    } finally { setFriendLoading(false); }
   }, [viewerId, friendLoading, friendStatus, friendRequestId, profile.id]);
 
   const handleFollow = useCallback(async () => {
@@ -696,23 +688,14 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
     setFollowLoading(true);
     try {
       const res = await apiFetch(`/api/profile/${profile.username}/follow`, { method: "POST" });
-      if (res.ok) {
-        const data = await res.json();
-        setFollowing(data.following);
-      }
-    } finally {
-      setFollowLoading(false);
-    }
+      if (res.ok) { const data = await res.json(); setFollowing(data.following); }
+    } finally { setFollowLoading(false); }
   }, [viewerId, followLoading, profile.username]);
 
-  // Load drafts for the selected mode when challenge modal opens
   const fetchChallengeDrafts = useCallback(async (mode: GameMode) => {
     try {
       const res = await fetch(`/api/drafts?mode=${mode}`);
-      if (res.ok) {
-        const data = await res.json();
-        setChallengeDrafts(data.drafts ?? []);
-      }
+      if (res.ok) { const data = await res.json(); setChallengeDrafts(data.drafts ?? []); }
     } catch { /* non-fatal */ }
   }, []);
 
@@ -728,31 +711,20 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
     setChallengeLoading(true);
     try {
       const res = await apiFetch("/api/challenges", {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({
-          receiverId: profile.id,
-          mode:       challengeMode,
-          draftId:    challengeDraftId ?? undefined,
-        }),
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ receiverId: profile.id, mode: challengeMode, draftId: challengeDraftId ?? undefined }),
       });
-      if (res.ok) {
-        setChallengeSent(true);
-        // ChallengeDropdown owns its open state; challengeSent=true shows the
-        // success message inside the modal and it auto-closes via the component.
-      }
-    } finally {
-      setChallengeLoading(false);
-    }
+      if (res.ok) setChallengeSent(true);
+    } finally { setChallengeLoading(false); }
   }, [challengeLoading, profile.id, challengeMode, challengeDraftId]);
 
   const tabs: { key: Tab; label: string }[] = [
     { key: "overview", label: "Overview" },
-    { key: "games",    label: "Games" },
-    { key: "stats",    label: "Stats" },
-    { key: "friends",   label: "Friends" },
-    { key: "following", label: "Following" },
-    { key: "tokens",    label: "Tokens" },
+    { key: "games",    label: "Games"    },
+    { key: "stats",    label: "Stats"    },
+    { key: "friends",  label: "Friends"  },
+    { key: "following",label: "Following"},
+    { key: "tokens",   label: "Tokens"   },
   ];
 
   const joinedYear = new Date(profile.createdAt).getFullYear();
@@ -762,18 +734,15 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
 
       {/* Header */}
       <div className="flex items-start gap-5 mb-8">
-        {/* Avatar */}
         <div className="w-16 h-16 rounded-2xl bg-amber-500/15 border border-amber-500/25 flex items-center justify-center text-2xl font-bold text-amber-400 flex-shrink-0">
           {profile.image
             ? <img src={profile.image} alt={profile.username} className="w-full h-full rounded-2xl object-cover" />
             : profile.username[0].toUpperCase()
           }
         </div>
-
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-3 flex-wrap">
             <h1 className="font-display text-2xl font-800 text-white">{profile.username}</h1>
-            {/* Token badges in header */}
             <div className="flex gap-1.5">
               {profile.tokens.slice(0, 4).map(t => <TokenBadge key={t.slug} token={t} size="sm" />)}
             </div>
@@ -781,28 +750,20 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
           {profile.name && <p className="text-white/45 text-sm mt-0.5">{profile.name}</p>}
           <p className="text-white/25 text-xs mt-1">Member since {joinedYear} · {profile.followerCount} followers</p>
         </div>
-
-        {/* Action buttons */}
         {!isOwnProfile && viewerId && (
           <div className="flex gap-2 flex-shrink-0">
-            {/* Friend button */}
             <button onClick={handleFriend} disabled={friendLoading}
               className={`px-4 py-2 rounded-xl text-sm font-semibold border transition-all ${
-                friendStatus === "friends"
-                  ? "border-white/15 text-white/50 hover:border-red-500/30 hover:text-red-400/70"
-                  : friendStatus === "pending_sent"
-                    ? "border-white/15 text-white/40"
-                    : friendStatus === "pending_received"
-                      ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20"
-                      : "border-amber-500/40 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
+                friendStatus === "friends"          ? "border-white/15 text-white/50 hover:border-red-500/30 hover:text-red-400/70" :
+                friendStatus === "pending_sent"     ? "border-white/15 text-white/40" :
+                friendStatus === "pending_received" ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20" :
+                                                      "border-amber-500/40 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20"
               }`}>
               {friendLoading ? "..." :
-                friendStatus === "friends" ? "Friends" :
-                friendStatus === "pending_sent" ? "Request Sent" :
-                friendStatus === "pending_received" ? "Accept Friend" :
-                "Add Friend"}
+                friendStatus === "friends"          ? "Friends" :
+                friendStatus === "pending_sent"     ? "Request Sent" :
+                friendStatus === "pending_received" ? "Accept Friend" : "Add Friend"}
             </button>
-            {/* Challenge button — only between mutual friends */}
             {friendStatus === "friends" && (
               <ChallengeDropdown
                 profileId={profile.id}
@@ -817,7 +778,6 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
                 onSend={handleSendChallenge}
               />
             )}
-            {/* Follow button */}
             <button onClick={handleFollow} disabled={followLoading}
               className={`px-4 py-2 rounded-xl text-sm font-semibold border transition-all ${
                 following
@@ -828,7 +788,6 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
             </button>
           </div>
         )}
-
       </div>
 
       {/* Tab nav */}
@@ -836,9 +795,7 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
         {tabs.map(t => (
           <button key={t.key} onClick={() => setActiveTab(t.key)}
             className={`px-3 py-2.5 text-sm font-medium border-b-2 transition-colors -mb-px ${
-              activeTab === t.key
-                ? "border-amber-400 text-amber-400"
-                : "border-transparent text-white/40 hover:text-white/60"
+              activeTab === t.key ? "border-amber-400 text-amber-400" : "border-transparent text-white/40 hover:text-white/60"
             }`}>
             {t.label}
           </button>
@@ -846,12 +803,12 @@ export default function ProfileClient({ profile, games, eloHistory, isOwnProfile
       </div>
 
       {/* Tab content */}
-      {activeTab === "overview" && <OverviewTab profile={profile} games={games} eloHistory={eloHistory} />}
-      {activeTab === "games"    && <GamesTab games={games} />}
-      {activeTab === "stats"    && <StatsTab profile={profile} eloHistory={eloHistory} />}
+      {activeTab === "overview"  && <OverviewTab profile={profile} games={games} eloHistory={eloHistory} liveGame={liveGame} />}
+      {activeTab === "games"     && <GamesTab games={games} />}
+      {activeTab === "stats"     && <StatsTab profile={profile} eloHistory={eloHistory} />}
       {activeTab === "friends"   && <FriendsTab isOwnProfile={isOwnProfile} />}
-      {activeTab === "following"  && <FollowingTab username={profile.username} isOwnProfile={isOwnProfile} />}
-      {activeTab === "tokens"   && <TokensTab tokens={profile.tokens} />}
+      {activeTab === "following" && <FollowingTab username={profile.username} isOwnProfile={isOwnProfile} />}
+      {activeTab === "tokens"    && <TokensTab tokens={profile.tokens} />}
     </div>
   );
 }

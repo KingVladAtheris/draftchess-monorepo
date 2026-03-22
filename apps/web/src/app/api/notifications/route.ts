@@ -1,10 +1,19 @@
 // apps/web/src/app/api/notifications/route.ts
-// GET — returns pending friend requests AND pending game challenges for the
-//        current user, shaped as a generic notifications array.
+//
+// GET  — returns all non-dismissed notifications for the current user,
+//        sorted newest first. Used for initial bell hydration on page load.
+//
+// PUT  — marks all notifications as read (resets unread count).
+//        Called when the bell is opened.
+//
+// CHANGE: notifications now come from the Notification table only.
+// Friend requests and challenges that previously came from their own
+// tables are now written to Notification rows at creation time.
+// The GET no longer queries FriendRequest or GameChallenge directly.
 
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/auth";
-import { prisma } from "@draftchess/db";
+import { auth }    from "@/auth";
+import { prisma }  from "@draftchess/db";
 
 export async function GET(req: NextRequest) {
   const session = await auth();
@@ -13,52 +22,29 @@ export async function GET(req: NextRequest) {
   }
 
   const userId = parseInt(session.user.id);
-  const now    = new Date();
 
-  const [pendingRequests, pendingChallenges] = await Promise.all([
-    prisma.friendRequest.findMany({
-      where:   { receiverId: userId, status: "pending" },
-      orderBy: { createdAt: "desc" },
-      select: {
-        id:        true,
-        createdAt: true,
-        sender:    { select: { id: true, username: true, image: true } },
-      },
-    }),
-    prisma.gameChallenge.findMany({
-      where:   { receiverId: userId, status: "pending", expiresAt: { gt: now } },
-      orderBy: { createdAt: "desc" },
-      select: {
-        id:           true,
-        mode:         true,
-        createdAt:    true,
-        expiresAt:    true,
-        senderDraftId: true,
-        sender:       { select: { id: true, username: true, image: true } },
-        senderDraft:  { select: { id: true, name: true } },
-      },
-    }),
-  ]);
+  const notifications = await prisma.notification.findMany({
+    where:   { userId },
+    orderBy: { createdAt: "desc" },
+  });
 
-  const notifications = [
-    ...pendingRequests.map(r => ({
-      id:        `friend-${r.id}`,
-      type:      "friend_request" as const,
-      requestId: r.id,
-      sender:    r.sender,
-      createdAt: r.createdAt.toISOString(),
-    })),
-    ...pendingChallenges.map(c => ({
-      id:          `challenge-${c.id}`,
-      type:        "challenge" as const,
-      challengeId: c.id,
-      mode:        c.mode,
-      sender:      c.sender,
-      senderDraft: c.senderDraft,
-      createdAt:   c.createdAt.toISOString(),
-      expiresAt:   c.expiresAt.toISOString(),
-    })),
-  ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  const unreadCount = notifications.filter(n => !n.read).length;
 
-  return NextResponse.json({ notifications });
+  return NextResponse.json({ notifications, unreadCount });
+}
+
+export async function PUT(req: NextRequest) {
+  const session = await auth();
+  if (!session?.user?.id) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  const userId = parseInt(session.user.id);
+
+  await prisma.notification.updateMany({
+    where: { userId, read: false },
+    data:  { read: true },
+  });
+
+  return NextResponse.json({ success: true });
 }

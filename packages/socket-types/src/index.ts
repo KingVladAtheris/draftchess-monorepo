@@ -1,10 +1,6 @@
 // packages/socket-types/src/index.ts
 //
-// CHANGES:
-//   - GameUpdatePayload extended with draw and rematch fields
-//   - ServerToClientEvents extended with draw-offered, draw-declined,
-//     draw-cancelled, rematch-offered, rematch-accepted, rematch-declined,
-//     rematch-cancelled events
+// CHANGE: Added 'notification' to ServerToClientEvents.
 
 export interface GameUpdatePayload {
   fen?:              string
@@ -27,15 +23,11 @@ export interface GameUpdatePayload {
   timeRemainingOnMove?:  number
   prepStartedAt?:    string | null
   isFriendGame?:     boolean
-
-  // Draw
-  drawOfferedBy?:  number   // userId, 0 to clear
-  drawDeclined?:   boolean  // true when opponent declines
-
-  // Rematch
-  rematchOfferedBy?: number  // userId who offered
-  rematchDeclined?:  boolean // true when opponent declines
-  rematchCancelled?: boolean // true when offerer navigates away
+  drawOfferedBy?:    number
+  drawDeclined?:     boolean
+  rematchOfferedBy?: number
+  rematchDeclined?:  boolean
+  rematchCancelled?: boolean
 }
 
 export interface GameSnapshotPayload extends GameUpdatePayload {
@@ -54,6 +46,12 @@ export interface ChallengeAcceptedPayload {
 
 export interface RematchAcceptedPayload {
   gameId: number
+}
+
+export interface NotificationPayload {
+  notificationId:   number
+  notificationType: string
+  payload:          Record<string, unknown>
 }
 
 export type RedisGameMessage = {
@@ -90,6 +88,7 @@ export interface ServerToClientEvents {
   'opponent-disconnected': (payload: { userId: number; gracePeriodSecs: number }) => void
   'opponent-connected':    (payload: { userId: number }) => void
   'queue-error':           (message: string) => void
+  'notification':          (payload: NotificationPayload) => void
 }
 
 export interface ClientToServerEvents {

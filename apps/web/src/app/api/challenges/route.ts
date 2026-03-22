@@ -1,14 +1,16 @@
 // apps/web/src/app/api/challenges/route.ts
 //
-// CHANGE: Added challengeLimiter rate limiting — 5 challenges sent per
-// user per hour. Keyed by userId so it's per-sender regardless of IP.
+// CHANGE: on successful challenge creation, writes a Notification row
+// for the receiver and publishes to draftchess:notifications so the bell
+// updates live without polling.
 
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/auth";
-import { prisma } from "@draftchess/db";
-import { checkCsrf } from "@/app/lib/csrf";
-import { consume, challengeLimiter } from "@/app/lib/rate-limit";
-import type { GameMode } from "@draftchess/shared/game-modes";
+import { NextRequest, NextResponse }          from "next/server";
+import { auth }                               from "@/auth";
+import { prisma }                             from "@draftchess/db";
+import { checkCsrf }                          from "@/app/lib/csrf";
+import { consume, challengeLimiter }          from "@/app/lib/rate-limit";
+import { publishNotification }                from "@/app/lib/redis-publisher";
+import type { GameMode }                      from "@draftchess/shared/game-modes";
 
 const CHALLENGE_TTL_MS = 10 * 60 * 1000;
 
@@ -23,7 +25,6 @@ export async function POST(req: NextRequest) {
 
   const senderId = parseInt(session.user.id);
 
-  // Rate limit by userId — prevents spam-challenging after declines.
   const limited = await consume(challengeLimiter, req, senderId.toString());
   if (limited) return limited;
 
@@ -77,15 +78,23 @@ export async function POST(req: NextRequest) {
       where:  { id: draftId },
       select: { userId: true, mode: true },
     });
-
     if (!draft || draft.userId !== senderId) {
       return NextResponse.json({ error: "Draft not found or not yours" }, { status: 404 });
     }
-
     if (draft.mode !== mode) {
       return NextResponse.json({ error: "Draft mode does not match challenge mode" }, { status: 400 });
     }
   }
+
+  // Fetch sender info for the notification payload
+  const sender = await prisma.user.findUnique({
+    where:  { id: senderId },
+    select: { id: true, username: true, image: true },
+  });
+
+  const senderDraft = draftId
+    ? await prisma.draft.findUnique({ where: { id: draftId }, select: { id: true, name: true } })
+    : null;
 
   const expiresAt = new Date(Date.now() + CHALLENGE_TTL_MS);
 
@@ -103,6 +112,32 @@ export async function POST(req: NextRequest) {
       expiresAt: true,
       sender:    { select: { id: true, username: true } },
     },
+  });
+
+  // Write Notification row for the receiver
+  const notification = await prisma.notification.create({
+    data: {
+      userId:  receiverId,
+      type:    "challenge",
+      payload: {
+        challengeId: challenge.id,
+        mode,
+        expiresAt:   expiresAt.toISOString(),
+        sender:      { id: sender!.id, username: sender!.username, image: sender!.image },
+        senderDraft: senderDraft ?? null,
+      },
+    },
+  });
+
+  // Push to receiver's bell live via WebSocket
+  await publishNotification(receiverId, "challenge", {
+    notificationId: notification.id,
+    challengeId:    challenge.id,
+    mode,
+    expiresAt:      expiresAt.toISOString(),
+    sender:         { id: sender!.id, username: sender!.username, image: sender!.image },
+    senderDraft:    senderDraft ?? null,
+    createdAt:      notification.createdAt.toISOString(),
   });
 
   return NextResponse.json({ challenge }, { status: 201 });

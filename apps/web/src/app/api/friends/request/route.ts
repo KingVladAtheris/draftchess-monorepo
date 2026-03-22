@@ -1,10 +1,14 @@
 // apps/web/src/app/api/friends/request/route.ts
-// POST — send a friend request to a user by userId.
+//
+// CHANGE: on successful friend request creation, writes a Notification row
+// for the receiver and publishes to draftchess:notifications so the bell
+// updates live without polling.
 
-import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/auth";
-import { prisma } from "@draftchess/db";
-import { checkCsrf } from "@/app/lib/csrf";
+import { NextRequest, NextResponse }          from "next/server";
+import { auth }                               from "@/auth";
+import { prisma }                             from "@draftchess/db";
+import { checkCsrf }                          from "@/app/lib/csrf";
+import { publishNotification }                from "@/app/lib/redis-publisher";
 
 export async function POST(req: NextRequest) {
   const csrfError = checkCsrf(req);
@@ -26,10 +30,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Cannot send request to yourself" }, { status: 400 });
   }
 
-  const target = await prisma.user.findUnique({ where: { id: targetUserId }, select: { id: true } });
+  const target = await prisma.user.findUnique({
+    where:  { id: targetUserId },
+    select: { id: true },
+  });
   if (!target) return NextResponse.json({ error: "User not found" }, { status: 404 });
 
-  // Check if already friends (accepted request in either direction)
   const alreadyFriends = await prisma.friendRequest.findFirst({
     where: {
       status: "accepted",
@@ -43,7 +49,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Already friends" }, { status: 409 });
   }
 
-  // Check if a pending request already exists in either direction
   const existing = await prisma.friendRequest.findFirst({
     where: {
       OR: [
@@ -54,7 +59,6 @@ export async function POST(req: NextRequest) {
   });
 
   if (existing) {
-    // If they sent us a request, auto-accept it
     if (existing.senderId === targetUserId && existing.status === "pending") {
       const accepted = await prisma.friendRequest.update({
         where: { id: existing.id },
@@ -65,8 +69,34 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "Request already exists" }, { status: 409 });
   }
 
+  // Fetch sender info for the notification payload
+  const sender = await prisma.user.findUnique({
+    where:  { id: senderId },
+    select: { id: true, username: true, image: true },
+  });
+
   const request = await prisma.friendRequest.create({
     data: { senderId, receiverId: targetUserId },
+  });
+
+  // Write Notification row for the receiver
+  const notification = await prisma.notification.create({
+    data: {
+      userId:  targetUserId,
+      type:    "friend_request",
+      payload: {
+        requestId: request.id,
+        sender:    { id: sender!.id, username: sender!.username, image: sender!.image },
+      },
+    },
+  });
+
+  // Push to receiver's bell live via WebSocket
+  await publishNotification(targetUserId, "friend_request", {
+    notificationId: notification.id,
+    requestId:      request.id,
+    sender:         { id: sender!.id, username: sender!.username, image: sender!.image },
+    createdAt:      notification.createdAt.toISOString(),
   });
 
   return NextResponse.json({ status: "pending", requestId: request.id });

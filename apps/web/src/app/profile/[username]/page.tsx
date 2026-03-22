@@ -1,7 +1,12 @@
-// apps/web/src/app/profile/page.tsx
-import { notFound } from "next/navigation";
-import { prisma } from "@draftchess/db";
-import { auth } from "@/auth";
+// apps/web/src/app/profile/[username]/page.tsx
+//
+// CHANGE: queries for an active/prep game for the viewed user.
+// Passes liveGame prop to ProfileClient so it can render
+// the "Playing right now" section.
+
+import { notFound }  from "next/navigation";
+import { prisma }    from "@draftchess/db";
+import { auth }      from "@/auth";
 import ProfileClient from "./ProfileClient";
 
 export async function generateMetadata({ params }: { params: Promise<{ username: string }> }) {
@@ -11,8 +16,8 @@ export async function generateMetadata({ params }: { params: Promise<{ username:
 
 export default async function ProfilePage({ params }: { params: Promise<{ username: string }> }) {
   const { username } = await params;
-  const session = await auth();
-  const viewerId = session?.user?.id ? parseInt(session.user.id) : null;
+  const session      = await auth();
+  const viewerId     = session?.user?.id ? parseInt(session.user.id) : null;
 
   const user = await prisma.user.findUnique({
     where: { username },
@@ -38,10 +43,36 @@ export default async function ProfilePage({ params }: { params: Promise<{ userna
 
   if (!user) notFound();
 
+  // ── Live game ──────────────────────────────────────────────────────────────
+  const liveGameRaw = await prisma.game.findFirst({
+    where: {
+      status: { in: ["active", "prep"] },
+      OR:     [{ player1Id: user.id }, { player2Id: user.id }],
+    },
+    select: {
+      id:            true,
+      status:        true,
+      mode:          true,
+      player1: { select: { id: true, username: true } },
+      player2: { select: { id: true, username: true } },
+    },
+  });
+
+  const liveGame = liveGameRaw
+    ? {
+        id:      liveGameRaw.id,
+        status:  liveGameRaw.status,
+        mode:    liveGameRaw.mode ?? "standard",
+        player1: liveGameRaw.player1,
+        player2: liveGameRaw.player2,
+      }
+    : null;
+
+  // ── Recent games ───────────────────────────────────────────────────────────
   const games = await prisma.game.findMany({
-    where: { status: "finished", OR: [{ player1Id: user.id }, { player2Id: user.id }] },
+    where:   { status: "finished", OR: [{ player1Id: user.id }, { player2Id: user.id }] },
     orderBy: { createdAt: "desc" },
-    take: 50,
+    take:    50,
     select: {
       id: true, mode: true, createdAt: true, winnerId: true,
       endReason: true, eloChange: true,
@@ -54,9 +85,9 @@ export default async function ProfilePage({ params }: { params: Promise<{ userna
   });
 
   const eloHistory = await prisma.game.findMany({
-    where: { status: "finished", OR: [{ player1Id: user.id }, { player2Id: user.id }] },
+    where:   { status: "finished", OR: [{ player1Id: user.id }, { player2Id: user.id }] },
     orderBy: { createdAt: "asc" },
-    select: { id: true, mode: true, createdAt: true, player1Id: true, player1EloAfter: true, player2EloAfter: true },
+    select:  { id: true, mode: true, createdAt: true, player1Id: true, player1EloAfter: true, player2EloAfter: true },
   });
 
   const eloPoints = {
@@ -94,7 +125,6 @@ export default async function ProfilePage({ params }: { params: Promise<{ userna
   const isOwnProfile = viewerId === user.id;
   const isFollowing  = viewerId ? user.followers.some(f => f.followerId === viewerId) : false;
 
-  // Friend request status
   let friendStatus: "none" | "pending_sent" | "pending_received" | "friends" = "none";
   let friendRequestId: number | null = null;
 
@@ -110,13 +140,9 @@ export default async function ProfilePage({ params }: { params: Promise<{ userna
     });
     if (friendRequest) {
       friendRequestId = friendRequest.id;
-      if (friendRequest.status === "accepted") {
-        friendStatus = "friends";
-      } else if (friendRequest.senderId === viewerId) {
-        friendStatus = "pending_sent";
-      } else {
-        friendStatus = "pending_received";
-      }
+      if      (friendRequest.status === "accepted")                       friendStatus = "friends";
+      else if (friendRequest.senderId === viewerId)                       friendStatus = "pending_sent";
+      else                                                                friendStatus = "pending_received";
     }
   }
 
@@ -146,6 +172,7 @@ export default async function ProfilePage({ params }: { params: Promise<{ userna
       profile={profileData}
       games={shapedGames}
       eloHistory={eloPoints}
+      liveGame={liveGame}
       isOwnProfile={isOwnProfile}
       isFollowing={isFollowing}
       friendStatus={friendStatus}
