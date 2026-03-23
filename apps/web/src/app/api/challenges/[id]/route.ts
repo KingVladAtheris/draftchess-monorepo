@@ -5,9 +5,8 @@
 //     write, so friend-game prep operations hit Redis on first request.
 //   - Double-accept race condition fixed: GameChallenge status update now
 //     uses updateMany with a status: "pending" guard (row-count check).
-//     Two simultaneous accepts can no longer both read "pending" and both
-//     create a game — the second write returns count=0 and we return 409.
 //   - Redis seed call mirrors what the matchmaker does for ranked games.
+//   - Added strict input validation for action and draftId.
 
 import { NextRequest, NextResponse }   from "next/server";
 import { auth }                        from "@/auth";
@@ -17,6 +16,11 @@ import { modeAuxPoints, type GameMode, GAMES_PLAYED_FIELD } from "@draftchess/sh
 import { publishGameUpdate, getRedisClient } from "@/app/lib/redis-publisher";
 import { buildCombinedDraftFen }       from "@draftchess/shared/fen-utils";
 import { seedGameState }               from "@draftchess/game-state";
+import { logger }                      from "@draftchess/logger";
+
+const log = logger.child({ module: "web:challenges-id" });
+
+const VALID_ACTIONS = new Set(["accept", "decline"]);
 
 export async function PATCH(
   req: NextRequest,
@@ -30,20 +34,40 @@ export async function PATCH(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const userId = parseInt(session.user.id);
-  const { id } = await params;
-  const challengeId = parseInt(id);
+  const userId = parseInt(session.user.id, 10);
+  if (isNaN(userId) || userId <= 0) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
-  let body: { action: "accept" | "decline"; draftId?: number };
+  const { id } = await params;
+  const challengeId = parseInt(id, 10);
+  if (isNaN(challengeId) || challengeId <= 0) {
+    return NextResponse.json({ error: "Invalid challenge ID" }, { status: 400 });
+  }
+
+  let body: unknown;
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { action, draftId: acceptorDraftId } = body;
-  if (action !== "accept" && action !== "decline") {
+  if (typeof body !== "object" || body === null) {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  const { action, draftId: rawDraftId } = body as Record<string, unknown>;
+
+  if (typeof action !== "string" || !VALID_ACTIONS.has(action)) {
     return NextResponse.json({ error: "action must be accept or decline" }, { status: 400 });
+  }
+
+  let acceptorDraftId: number | undefined;
+  if (rawDraftId !== undefined && rawDraftId !== null) {
+    if (typeof rawDraftId !== "number" || !Number.isInteger(rawDraftId) || rawDraftId <= 0) {
+      return NextResponse.json({ error: "draftId must be a positive integer" }, { status: 400 });
+    }
+    acceptorDraftId = rawDraftId;
   }
 
   const challenge = await prisma.gameChallenge.findUnique({
@@ -62,11 +86,9 @@ export async function PATCH(
   if (!challenge || challenge.receiverId !== userId) {
     return NextResponse.json({ error: "Challenge not found" }, { status: 404 });
   }
-
   if (challenge.status !== "pending") {
     return NextResponse.json({ error: "Challenge is no longer pending" }, { status: 409 });
   }
-
   if (new Date() > challenge.expiresAt) {
     await prisma.gameChallenge.update({ where: { id: challengeId }, data: { status: "expired" } });
     return NextResponse.json({ error: "Challenge has expired" }, { status: 410 });
@@ -74,6 +96,7 @@ export async function PATCH(
 
   if (action === "decline") {
     await prisma.gameChallenge.update({ where: { id: challengeId }, data: { status: "declined" } });
+    log.info({ challengeId, userId }, "challenge declined");
     return NextResponse.json({ success: true });
   }
 
@@ -93,12 +116,12 @@ export async function PATCH(
 
   const mode      = challenge.mode as GameMode;
   const auxPoints = modeAuxPoints(mode);
+
   const senderIsWhite = Math.random() < 0.5;
   const whitePlayerId = senderIsWhite ? challenge.senderId : userId;
 
-  // Fetch ELO/stats for both players so the game hash is fully seeded
-  // (required for ELO calculation on finalization, even for friend games).
   const gamesField = GAMES_PLAYED_FIELD[mode];
+
   const [sender, receiver] = await Promise.all([
     prisma.user.findUnique({
       where:  { id: challenge.senderId },
@@ -120,15 +143,14 @@ export async function PATCH(
     return NextResponse.json({ error: "User not found" }, { status: 404 });
   }
 
-  // Resolve ELO field for the mode
-  const eloField = mode === "standard" ? "eloStandard" : mode === "pauper" ? "eloPauper" : "eloRoyal";
-  const p1EloBefore = sender[eloField];
-  const p2EloBefore = receiver[eloField];
+  const eloField      = mode === "standard" ? "eloStandard" : mode === "pauper" ? "eloPauper" : "eloRoyal";
+  const p1EloBefore   = sender[eloField];
+  const p2EloBefore   = receiver[eloField];
   const p1GamesPlayed = sender[gamesField];
   const p2GamesPlayed = receiver[gamesField];
 
   // ── Compute combined FEN ────────────────────────────────────────────────────
-  let gameFen: string | undefined = undefined;
+  let gameFen: string | undefined;
   let whiteDraftFen = "";
   let blackDraftFen = "";
 
@@ -137,6 +159,7 @@ export async function PATCH(
       prisma.draft.findUnique({ where: { id: challenge.senderDraftId }, select: { fen: true } }),
       prisma.draft.findUnique({ where: { id: acceptorDraftId },         select: { fen: true } }),
     ]);
+
     if (senderDraft?.fen && acceptorDraft?.fen) {
       whiteDraftFen = senderIsWhite ? senderDraft.fen : acceptorDraft.fen;
       blackDraftFen = senderIsWhite ? acceptorDraft.fen : senderDraft.fen;
@@ -147,10 +170,6 @@ export async function PATCH(
   const now = new Date();
 
   // ── Atomic Postgres write + double-accept guard ───────────────────────────
-  // The transaction throws a sentinel error if another request already
-  // accepted the challenge. We let it propagate and catch it below rather
-  // than using .catch() on the transaction — that would widen the return
-  // type and cause a destructuring type error.
   let game: { id: number };
 
   try {
@@ -192,8 +211,6 @@ export async function PATCH(
   }
 
   // ── Seed Redis game hash immediately ──────────────────────────────────────────
-  // This ensures all subsequent prep operations (place, ready, status) hit Redis
-  // on first request rather than cold-starting through the Postgres fallback.
   try {
     const redis = await getRedisClient();
     await seedGameState(redis as any, {
@@ -217,12 +234,9 @@ export async function PATCH(
       player2GamesPlayed: p2GamesPlayed,
     });
   } catch (err) {
-    // Non-fatal: the Postgres fallback in loadGameState will reseed on first
-    // request. Log and continue so the game is not blocked by a Redis blip.
-    console.error("[challenges] failed to seed Redis game hash", err);
+    log.error({ gameId: game.id, err }, "failed to seed Redis game hash");
   }
 
-  // Notify challenger via their personal socket room
   await publishGameUpdate(game.id, {
     status:       "prep",
     isFriendGame: true,
@@ -237,6 +251,8 @@ export async function PATCH(
     event:   "challenge-accepted",
     payload: { gameId: game.id },
   }));
+
+  log.info({ challengeId, gameId: game.id, userId }, "challenge accepted");
 
   return NextResponse.json({ gameId: game.id });
 }
@@ -253,9 +269,16 @@ export async function DELETE(
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const userId      = parseInt(session.user.id);
+  const userId = parseInt(session.user.id, 10);
+  if (isNaN(userId) || userId <= 0) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   const { id }      = await params;
-  const challengeId = parseInt(id);
+  const challengeId = parseInt(id, 10);
+  if (isNaN(challengeId) || challengeId <= 0) {
+    return NextResponse.json({ error: "Invalid challenge ID" }, { status: 400 });
+  }
 
   const challenge = await prisma.gameChallenge.findUnique({
     where:  { id: challengeId },
@@ -265,11 +288,13 @@ export async function DELETE(
   if (!challenge || challenge.senderId !== userId) {
     return NextResponse.json({ error: "Challenge not found" }, { status: 404 });
   }
-
   if (challenge.status !== "pending") {
     return NextResponse.json({ error: "Challenge is no longer pending" }, { status: 409 });
   }
 
   await prisma.gameChallenge.update({ where: { id: challengeId }, data: { status: "cancelled" } });
+
+  log.info({ challengeId, userId }, "challenge cancelled");
+
   return NextResponse.json({ success: true });
 }

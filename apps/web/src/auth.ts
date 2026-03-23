@@ -4,6 +4,9 @@ import type { NextAuthConfig }           from "next-auth";
 import CredentialsProvider               from "next-auth/providers/credentials";
 import { prisma }                        from "@draftchess/db";
 import bcrypt                            from "bcrypt";
+import { logger }                        from "@draftchess/logger";
+
+const log = logger.child({ module: "web:auth" });
 
 const authConfig: NextAuthConfig = {
   providers: [
@@ -16,19 +19,27 @@ const authConfig: NextAuthConfig = {
       async authorize(credentials) {
         if (!credentials?.email || !credentials?.password) return null;
 
+        // Basic format guards before hitting the DB
+        const email    = (credentials.email as string).trim().toLowerCase();
+        const password = credentials.password as string;
+
+        if (!email || !password) return null;
+
         try {
           const user = await prisma.user.findUnique({
-            where:  { email: credentials.email as string },
-            select: { id: true, email: true, username: true, passwordHash: true },
+            where:  { email },
+            select: { id: true, email: true, username: true, passwordHash: true, isBanned: true },
           });
 
           if (!user?.passwordHash) return null;
 
-          const isValid = await bcrypt.compare(
-            credentials.password as string,
-            user.passwordHash,
-          );
+          // Banned users cannot log in
+          if (user.isBanned) {
+            log.warn({ userId: user.id }, "banned user attempted login");
+            return null;
+          }
 
+          const isValid = await bcrypt.compare(password, user.passwordHash);
           if (!isValid) return null;
 
           return {
@@ -37,14 +48,18 @@ const authConfig: NextAuthConfig = {
             name:  user.username,
           };
         } catch (error) {
-          console.error("[auth] authorize error:", error);
+          log.error({ err: error }, "authorize error");
           return null;
         }
       },
     }),
   ],
 
-  session: { strategy: "jwt" },
+  session: {
+    strategy: "jwt",
+    // Explicit session lifetime — 30 days, sliding
+    maxAge:   30 * 24 * 60 * 60,
+  },
 
   pages: { signIn: "/login" },
 
@@ -62,10 +77,6 @@ const authConfig: NextAuthConfig = {
   secret: process.env.AUTH_SECRET,
 };
 
-// Use NextAuthResult to annotate each export individually.
-// Destructuring and letting TS infer causes "cannot be named without a reference
-// to next-auth/lib internals" in pnpm monorepos. NextAuthResult is a stable
-// public type that avoids the internal path reference entirely.
 const result: NextAuthResult = NextAuth(authConfig);
 
 export const handlers: NextAuthResult["handlers"] = result.handlers;

@@ -1,3 +1,19 @@
+// apps/web/src/app/play/game/[id]/ClientGame.tsx
+//
+// CHANGE: Rematch source game ID is now reliably resolved.
+//
+// Previously rematchSourceGameId was initialised to the current page's gameId
+// and only updated when a live rematch-offered socket event arrived. If the
+// page loaded with a pre-existing offer (e.g. after a browser refresh) the
+// source game ID stayed as the current gameId, which could be wrong when the
+// offer lives on a different (older) finished game.
+//
+// Fix: the /api/game/[id]/status endpoint now returns rematchOfferedBy and
+// rematchSourceGameId in its response. We read those on initial load and seed
+// rematchSourceGameId from there. The live socket event still updates it for
+// the in-session case. The accept route's slow-path scan is still in place as
+// a final safety net.
+
 "use client";
 
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
@@ -46,9 +62,9 @@ type ClientGameProps = {
   mode: GameMode;
 };
 
-const MOVE_TIME_LIMIT       = 30000;
+const MOVE_TIME_LIMIT         = 30000;
 const TIMEBANK_BONUS_INTERVAL = 20;
-const REMATCH_EXPIRY_MS     = 30000;
+const REMATCH_EXPIRY_MS       = 30000;
 
 function getTimerClass(ms: number, isActive: boolean) {
   if (!isActive) return "text-white/30";
@@ -57,9 +73,11 @@ function getTimerClass(ms: number, isActive: boolean) {
   if (ms < 15000) return "text-orange-400";
   return "text-amber-400";
 }
+
 function getTimerBarWidth(ms: number): number {
   return Math.max(0, Math.min(100, (ms / MOVE_TIME_LIMIT) * 100));
 }
+
 function getTimerBarClass(ms: number): string {
   if (ms <= 0 || ms < 8000)  return "bg-red-500";
   if (ms < 15000)             return "bg-orange-400";
@@ -71,7 +89,6 @@ export default function ClientGame({
   initialPrepStartedAt, initialReadyPlayer1, initialReadyPlayer2,
   initialAuxPointsPlayer1, initialAuxPointsPlayer2, player1Id, player2Id, mode,
 }: ClientGameProps) {
-
   const toast = useToast();
 
   const [fen, setFen]                             = useState(initialFen);
@@ -97,29 +114,26 @@ export default function ClientGame({
   const [opponentConnected, setOpponentConnected] = useState(true);
 
   // ── Draw state ──────────────────────────────────────────────────────────────
-  // 0 = no offer, non-zero = userId who offered
   const [drawOfferedBy, setDrawOfferedBy]               = useState(0);
-  // move number when last decline happened — drives cooldown display
   const [drawDeclinedMoveNumber, setDrawDeclinedMoveNumber] = useState(0);
   const [drawSubmitting, setDrawSubmitting]             = useState(false);
 
   // ── Rematch state ───────────────────────────────────────────────────────────
-  // 0 = no offer, non-zero = userId who offered
   const [rematchOfferedBy, setRematchOfferedBy]         = useState(0);
   const [rematchOfferedAt, setRematchOfferedAt]         = useState(0);
   const [rematchExpired, setRematchExpired]             = useState(false);
   const [rematchSubmitting, setRematchSubmitting]       = useState(false);
-  // Countdown ms remaining for the outgoing offer display
   const [rematchCountdown, setRematchCountdown]         = useState(REMATCH_EXPIRY_MS);
-  // The game ID the rematch offer is stored on — always the finished game,
-  // never the new game. Needed because the component's gameId prop refers to
-  // the current page's game, which may differ from where the offer lives.
-  const [rematchSourceGameId, setRematchSourceGameId]   = useState(gameId);
+
+  // FIX: rematchSourceGameId is seeded from the status API response on load,
+  // not just from the current gameId. This ensures that after a page refresh
+  // we still POST accept/decline to the game that holds the offer, even if
+  // that's a different (older) finished game than the current URL param.
+  const [rematchSourceGameId, setRematchSourceGameId] = useState(gameId);
 
   const chessRef         = useRef<DraftChess>(new DraftChess(initialFen));
   const isSubmittingMove = useRef(false);
-
-  const timerSnapshot = useRef<{
+  const timerSnapshot    = useRef<{
     lastMoveAt: Date;
     player1Timebank: number;
     player2Timebank: number;
@@ -127,7 +141,6 @@ export default function ClientGame({
 
   const player1TimebankRef = useRef(60000);
   const player2TimebankRef = useRef(60000);
-
   useEffect(() => { player1TimebankRef.current = player1Timebank; }, [player1Timebank]);
   useEffect(() => { player2TimebankRef.current = player2Timebank; }, [player2Timebank]);
 
@@ -153,7 +166,7 @@ export default function ClientGame({
     return Math.max(0, 3 - (moveNumber - drawDeclinedMoveNumber));
   }, [drawDeclinedMoveNumber, moveNumber]);
 
-  const canOfferDraw = status === "active" && drawOfferedBy === 0 && drawCooldownRemaining === 0;
+  const canOfferDraw        = status === "active" && drawOfferedBy === 0 && drawCooldownRemaining === 0;
   const iHaveOfferedDraw    = drawOfferedBy === myUserId;
   const opponentOfferedDraw = drawOfferedBy !== 0 && drawOfferedBy !== myUserId;
 
@@ -218,6 +231,7 @@ export default function ClientGame({
       setFen(payload.fen);
       try { chessRef.current = new DraftChess(payload.fen); } catch { /* keep current */ }
     }
+
     if (payload.status       !== undefined) setStatus(payload.status as GameStatus);
     if (payload.readyPlayer1 !== undefined) setReadyPlayer1(payload.readyPlayer1);
     if (payload.readyPlayer2 !== undefined) setReadyPlayer2(payload.readyPlayer2);
@@ -260,7 +274,6 @@ export default function ClientGame({
         player2EloAfter: payload.player2EloAfter,
         eloChange:       payload.eloChange,
       });
-      // Clear any draw offer when game ends
       setDrawOfferedBy(0);
     }
 
@@ -273,8 +286,6 @@ export default function ClientGame({
     }
     if (payload.drawDeclined) {
       setDrawOfferedBy(0);
-      // Server will have updated drawDeclinedMoveNumber via the next move event;
-      // optimistically set it to current moveNumber so UI updates immediately.
       setDrawDeclinedMoveNumber(moveNumber);
       if (iHaveOfferedDraw) toast.warn("Draw offer declined");
     }
@@ -284,14 +295,12 @@ export default function ClientGame({
       setRematchOfferedBy(payload.rematchOfferedBy);
       setRematchOfferedAt(Date.now());
       setRematchExpired(false);
-      // Record which game this offer lives on so accept/decline POST to the
-      // correct gameId even if the component is somehow re-used across games.
-      setRematchSourceGameId(gameId);
+      // FIX: source game comes from the event payload when available;
+      // falls back to current gameId for in-session offers.
+      setRematchSourceGameId(payload.rematchSourceGameId ?? gameId);
       if (payload.rematchOfferedBy !== myUserId) toast.info("Opponent wants a rematch");
     }
     if (payload.rematchDeclined) {
-      // iHaveOfferedRematch is true for the sender — show them the decline toast.
-      // The decliner already knows; they clicked the button.
       if (rematchOfferedBy === myUserId) toast.warn("Rematch declined");
       setRematchOfferedBy(0);
       setRematchExpired(false);
@@ -300,17 +309,11 @@ export default function ClientGame({
       setRematchOfferedBy(0);
       setRematchExpired(false);
     }
-  }, [updateTimerSnapshot, myUserId, moveNumber, iHaveOfferedDraw, toast]);
+  }, [updateTimerSnapshot, myUserId, moveNumber, iHaveOfferedDraw, toast, gameId, rematchOfferedBy]);
 
-  // Stable refs so the socket useEffect can call the latest versions of these
-  // callbacks without them appearing in its dependency array.
-  // Without this, any state change that causes handleGameUpdate to get a new
-  // reference (e.g. moveNumber incrementing) re-runs the socket effect, which
-  // re-emits join-game, which triggers a snapshot, which increments moveNumber
-  // — an infinite loop.
-  const handleGameUpdateRef  = useRef(handleGameUpdate);
+  const handleGameUpdateRef    = useRef(handleGameUpdate);
   const updateTimerSnapshotRef = useRef(updateTimerSnapshot);
-  useEffect(() => { handleGameUpdateRef.current  = handleGameUpdate;  }, [handleGameUpdate]);
+  useEffect(() => { handleGameUpdateRef.current    = handleGameUpdate;  }, [handleGameUpdate]);
   useEffect(() => { updateTimerSnapshotRef.current = updateTimerSnapshot; }, [updateTimerSnapshot]);
 
   // ─── WebSocket setup ───────────────────────────────────────────────────────
@@ -325,6 +328,7 @@ export default function ClientGame({
         if (!mounted) return;
 
         handleGameUpdateRef.current(data);
+
         if (data.prepStartedAt) setPrepStartedAt(new Date(data.prepStartedAt));
         if (data.moveNumber !== undefined) setMoveNumber(data.moveNumber);
         if (data.lastMoveAt) {
@@ -335,10 +339,24 @@ export default function ClientGame({
           setGameResult({ winnerId: data.winnerId ?? null, endReason: data.endReason, player1EloAfter: data.player1EloAfter, player2EloAfter: data.player2EloAfter, eloChange: data.eloChange });
         }
 
+        // FIX: Seed rematch state from the initial status load.
+        // If the game is finished and someone already offered a rematch before
+        // this page load (e.g. after a browser refresh), we need to know:
+        //   1. Who offered (rematchOfferedBy)
+        //   2. Which game the offer is stored on (rematchSourceGameId)
+        // The status API returns these fields for finished games.
+        if (data.rematchOfferedBy && data.rematchOfferedBy !== 0) {
+          setRematchOfferedBy(data.rematchOfferedBy);
+          setRematchOfferedAt(data.rematchOfferedAt ?? Date.now());
+          setRematchExpired(false);
+          setRematchSourceGameId(data.rematchSourceGameId ?? gameId);
+        }
+
         const socket = await getSocket();
         if (!mounted) return;
 
         socket.emit("join-game", gameId);
+
         socket.on("game-update",           (p: any)   => { if (mounted) handleGameUpdateRef.current(p); });
         socket.on("opponent-disconnected", () => { if (mounted) { setOpponentConnected(false); toast.warn("Opponent disconnected"); } });
         socket.on("opponent-connected",    () => { if (mounted) { setOpponentConnected(true);  toast.info("Opponent reconnected"); } });
@@ -372,7 +390,9 @@ export default function ClientGame({
         if (mounted) setSocketError("Failed to connect to game server.");
       }
     };
+
     init();
+
     return () => {
       mounted = false;
       getSocket().then(s => {
@@ -547,11 +567,7 @@ export default function ClientGame({
     setDrawSubmitting(true);
     try {
       const res = await apiFetch(`/api/game/${gameId}/draw/offer`, { method: "POST" });
-      if (!res.ok) {
-        const err = await res.json();
-        toast.warn(err.error ?? "Could not offer draw");
-      }
-      // Optimistic update — server broadcasts drawOfferedBy via game-update
+      if (!res.ok) { const err = await res.json(); toast.warn(err.error ?? "Could not offer draw"); }
     } catch { toast.error("Connection error — could not offer draw"); }
     finally { setDrawSubmitting(false); }
   };
@@ -596,6 +612,7 @@ export default function ClientGame({
         setRematchOfferedBy(myUserId);
         setRematchOfferedAt(Date.now());
         setRematchExpired(false);
+        // The offer is always stored on the current finished game
         setRematchSourceGameId(gameId);
       } else {
         const err = await res.json();
@@ -609,8 +626,8 @@ export default function ClientGame({
     if (rematchSubmitting) return;
     setRematchSubmitting(true);
     try {
-      // Use rematchSourceGameId — the offer lives on the finished game,
-      // not necessarily the current gameId prop.
+      // FIX: always POST to rematchSourceGameId, which was seeded on load
+      // from the status API — not blindly from the current URL param.
       const res = await apiFetch(`/api/game/${rematchSourceGameId}/rematch/accept`, { method: "POST" });
       if (!res.ok) {
         const err = await res.json();
@@ -627,9 +644,6 @@ export default function ClientGame({
   const handleRematchDecline = async () => {
     if (rematchSubmitting) return;
     setRematchSubmitting(true);
-    // Clear local state immediately — don't wait for server response.
-    // If the offer is already gone (expired, race) the server returns 409
-    // but the UI should still reset to the idle state.
     setRematchOfferedBy(0);
     try {
       await apiFetch(`/api/game/${rematchSourceGameId}/rematch/decline`, { method: "POST" });
@@ -668,7 +682,6 @@ export default function ClientGame({
           .slide-in { animation: slideIn 0.4s ease both; }
           .pulse-gold { animation: pulseGold 1.5s ease-in-out infinite; }
         `}</style>
-
         <div className="flex min-h-[calc(100vh-56px)] bg-[#0f1117]">
           <aside className="w-72 flex-shrink-0 bg-[#1a1d2e] border-r border-white/8 flex flex-col">
             <div className="px-6 pt-6 pb-5 border-b border-white/6">
@@ -731,7 +744,6 @@ export default function ClientGame({
               </button>
             </div>
           </aside>
-
           <main className="flex-1 flex flex-col items-center justify-center p-8 gap-5">
             {socketError && (
               <div className="w-full max-w-[600px] px-4 py-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-sm text-center">⚠ {socketError}</div>
@@ -775,18 +787,15 @@ export default function ClientGame({
             const isWinner = gameResult.winnerId === myUserId;
             const isDraw   = gameResult.winnerId === null;
             const myElo    = isPlayer1 ? gameResult.player1EloAfter : gameResult.player2EloAfter;
-
             return (
               <div className="bg-[#1a1d2e] border border-white/12 rounded-3xl p-10 shadow-2xl text-center max-w-sm w-full mx-6 scale-in">
                 <div className={`w-20 h-20 mx-auto rounded-2xl flex items-center justify-center text-5xl mb-6 ${isDraw ? "bg-amber-500/15 border border-amber-500/30" : isWinner ? "bg-emerald-500/15 border border-emerald-500/30" : "bg-red-500/10 border border-red-500/20"}`}>
                   {isDraw ? "=" : isWinner ? "♔" : "♚"}
                 </div>
-
                 <h2 className={`font-display text-4xl font-800 mb-1 ${isDraw ? "text-amber-400" : isWinner ? "text-emerald-400" : "text-white/70"}`}>
                   {isDraw ? "Draw" : isWinner ? "Victory" : "Defeat"}
                 </h2>
                 <p className="text-white/40 text-sm mb-7">{endReasonLabels[gameResult.endReason] ?? gameResult.endReason}</p>
-
                 {myElo !== undefined && gameResult.eloChange !== undefined && (
                   <div className="flex items-center justify-center gap-3 mb-7 px-5 py-3 rounded-xl bg-white/[0.04] border border-white/8">
                     <span className="text-white/50 text-sm">Rating</span>
@@ -796,21 +805,14 @@ export default function ClientGame({
                     </span>
                   </div>
                 )}
-
                 {/* ── Rematch section ──────────────────────────────────────── */}
                 <div className="mb-5">
-                  {/* Neither player has offered yet */}
                   {rematchOfferedBy === 0 && !rematchExpired && (
-                    <button
-                      onClick={handleRematchOffer}
-                      disabled={rematchSubmitting}
-                      className="w-full py-3 rounded-xl bg-white/[0.05] border border-white/10 hover:border-amber-500/30 hover:bg-amber-500/8 text-white/60 hover:text-amber-400 font-display font-600 text-sm transition-all duration-200 disabled:opacity-40"
-                    >
+                    <button onClick={handleRematchOffer} disabled={rematchSubmitting}
+                      className="w-full py-3 rounded-xl bg-white/[0.05] border border-white/10 hover:border-amber-500/30 hover:bg-amber-500/8 text-white/60 hover:text-amber-400 font-display font-600 text-sm transition-all duration-200 disabled:opacity-40">
                       {rematchSubmitting ? "Sending…" : "Rematch"}
                     </button>
                   )}
-
-                  {/* I offered — waiting with countdown */}
                   {iHaveOfferedRematch && !rematchExpired && (
                     <div className="rounded-xl border border-white/8 bg-white/[0.03] px-4 py-3 flex items-center justify-between gap-3">
                       <div className="flex items-center gap-2.5">
@@ -822,43 +824,28 @@ export default function ClientGame({
                       </span>
                     </div>
                   )}
-
-                  {/* Opponent offered — accept or decline */}
                   {opponentOfferedRematch && !rematchExpired && (
                     <div className="rounded-xl border border-amber-500/25 bg-amber-500/6 px-4 py-3">
                       <p className="text-xs text-amber-400/80 mb-3 text-center">Opponent wants a rematch</p>
                       <div className="flex gap-2">
-                        <button
-                          onClick={handleRematchAccept}
-                          disabled={rematchSubmitting}
-                          className="flex-1 py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-[#0f1117] font-display font-700 text-sm transition-colors disabled:opacity-50"
-                        >
+                        <button onClick={handleRematchAccept} disabled={rematchSubmitting}
+                          className="flex-1 py-2.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-[#0f1117] font-display font-700 text-sm transition-colors disabled:opacity-50">
                           {rematchSubmitting ? "…" : "Accept"}
                         </button>
-                        <button
-                          onClick={handleRematchDecline}
-                          disabled={rematchSubmitting}
-                          className="flex-1 py-2.5 rounded-lg border border-white/10 hover:border-white/20 text-white/40 hover:text-white/60 font-display font-600 text-sm transition-all disabled:opacity-50"
-                        >
+                        <button onClick={handleRematchDecline} disabled={rematchSubmitting}
+                          className="flex-1 py-2.5 rounded-lg border border-white/10 hover:border-white/20 text-white/40 hover:text-white/60 font-display font-600 text-sm transition-all disabled:opacity-50">
                           Decline
                         </button>
                       </div>
                     </div>
                   )}
-
-                  {/* Offer expired */}
                   {rematchExpired && rematchOfferedBy === 0 && (
                     <p className="text-xs text-white/25 text-center py-1">Rematch offer expired</p>
                   )}
                 </div>
-
                 <div className="flex gap-3 justify-center">
-                  <a href="/play/select" className="flex-1 py-3 bg-amber-400 hover:bg-amber-300 text-[#0f1117] font-display font-700 text-sm rounded-xl transition-colors text-center">
-                    Play Again
-                  </a>
-                  <a href="/" className="flex-1 py-3 border border-white/12 hover:border-white/25 hover:bg-white/5 text-white/60 hover:text-white font-display font-600 text-sm rounded-xl transition-all text-center">
-                    Home
-                  </a>
+                  <a href="/play/select" className="flex-1 py-3 bg-amber-400 hover:bg-amber-300 text-[#0f1117] font-display font-700 text-sm rounded-xl transition-colors text-center">Play Again</a>
+                  <a href="/" className="flex-1 py-3 border border-white/12 hover:border-white/25 hover:bg-white/5 text-white/60 hover:text-white font-display font-600 text-sm rounded-xl transition-all text-center">Home</a>
                 </div>
               </div>
             );
@@ -866,7 +853,6 @@ export default function ClientGame({
         </div>
       )}
 
-      {/* ── Timebank bonus toast ─────────────────────────────────────────── */}
       {showTimebankBonus && (
         <div className="fixed top-20 left-1/2 -translate-x-1/2 z-40 pointer-events-none bonus-flash">
           <div className="px-5 py-3 rounded-2xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-400 text-sm font-display font-600 shadow-xl">
@@ -875,24 +861,17 @@ export default function ClientGame({
         </div>
       )}
 
-      {/* ── Draw offer banner — floats above board when active ──────────── */}
       {opponentOfferedDraw && (
         <div className="fixed top-20 left-1/2 -translate-x-1/2 z-40 w-full max-w-sm mx-auto px-4">
           <div className="rounded-2xl border border-white/12 bg-[#1a1d2e]/95 backdrop-blur-sm px-5 py-4 shadow-2xl scale-in">
             <p className="text-xs text-white/45 uppercase tracking-wider mb-3 text-center">Opponent offers a draw</p>
             <div className="flex gap-2">
-              <button
-                onClick={handleDrawAccept}
-                disabled={drawSubmitting}
-                className="flex-1 py-2.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 hover:border-white/20 text-white/70 hover:text-white font-display font-600 text-sm transition-all disabled:opacity-40"
-              >
+              <button onClick={handleDrawAccept} disabled={drawSubmitting}
+                className="flex-1 py-2.5 rounded-xl bg-white/[0.08] hover:bg-white/[0.14] border border-white/10 hover:border-white/20 text-white/70 hover:text-white font-display font-600 text-sm transition-all disabled:opacity-40">
                 {drawSubmitting ? "…" : "Accept draw"}
               </button>
-              <button
-                onClick={handleDrawDecline}
-                disabled={drawSubmitting}
-                className="flex-1 py-2.5 rounded-xl border border-white/8 text-white/35 hover:text-white/55 hover:border-white/15 font-display font-600 text-sm transition-all disabled:opacity-40"
-              >
+              <button onClick={handleDrawDecline} disabled={drawSubmitting}
+                className="flex-1 py-2.5 rounded-xl border border-white/8 text-white/35 hover:text-white/55 hover:border-white/15 font-display font-600 text-sm transition-all disabled:opacity-40">
                 Decline
               </button>
             </div>
@@ -900,14 +879,9 @@ export default function ClientGame({
         </div>
       )}
 
-      {/* ── Main layout ──────────────────────────────────────────────────── */}
       <div className="min-h-[calc(100vh-56px)] bg-[#0f1117] flex items-center justify-center px-4 py-6">
         <div className="w-full max-w-[1000px] flex flex-col lg:flex-row gap-6 items-center lg:items-start">
-
-          {/* ── Board column ───────────────────────────────────────────── */}
           <div className="flex flex-col items-center gap-3 flex-1 min-w-0 w-full max-w-[600px]">
-
-            {/* Opponent row */}
             <div className="w-full flex items-center justify-between gap-3 px-1 slide-in">
               <div className="flex items-center gap-2.5">
                 <div className={`w-2 h-2 rounded-full flex-shrink-0 ${opponentConnected ? "bg-emerald-400" : "bg-red-400"}`} />
@@ -925,10 +899,8 @@ export default function ClientGame({
               </div>
             </div>
 
-            {/* Board */}
             <div className="relative w-full rounded-2xl overflow-hidden border border-white/10 shadow-[0_0_80px_rgba(0,0,0,0.7)] slide-in">
               <Chessboard options={{ position: fen, onPieceDrop: handlePieceDrop, boardOrientation: isWhite ? "white" : "black", squareStyles: customSquareStyles }} />
-
               {pendingPromotion && (
                 <div className="absolute inset-0 bg-black/75 backdrop-blur-sm flex flex-col items-center justify-center rounded-2xl z-10">
                   <div className="bg-[#1a1d2e] border border-white/12 rounded-2xl p-6 text-center scale-in">
@@ -950,7 +922,6 @@ export default function ClientGame({
               )}
             </div>
 
-            {/* My row */}
             <div className="w-full flex items-center justify-between gap-3 px-1 slide-in">
               <div className="flex items-center gap-2.5">
                 <div className="w-8 h-8 rounded-lg bg-amber-500/15 border border-amber-500/25 flex items-center justify-center text-lg">{isWhite ? "♔" : "♚"}</div>
@@ -968,10 +939,7 @@ export default function ClientGame({
             </div>
           </div>
 
-          {/* ── Right sidebar ───────────────────────────────────────────── */}
           <aside className="flex flex-col gap-4 w-full lg:w-56 flex-shrink-0 slide-in">
-
-            {/* Move timer */}
             <div className="rounded-2xl border border-white/8 bg-[#1a1d2e] p-5">
               <div className="flex items-center justify-between mb-3">
                 <span className="text-[10px] font-bold uppercase tracking-widest text-white/30">
@@ -981,7 +949,6 @@ export default function ClientGame({
                 </span>
                 <span className="text-[10px] text-white/25 tabular-nums">#{moveNumber}</span>
               </div>
-
               {status === "active" && (
                 <>
                   <div className={`font-display text-5xl font-800 tabular-nums leading-none mb-3 ${getTimerClass(largeDisplayMs, true)} ${largeDisplayMs < 8000 ? "timer-urgent" : ""}`}>
@@ -995,13 +962,11 @@ export default function ClientGame({
                   </p>
                 </>
               )}
-
               {status === "finished" && (
                 <p className="text-2xl font-display font-700 text-white/40">Finished</p>
               )}
             </div>
 
-            {/* Socket warning */}
             {socketError && (
               <div className="px-4 py-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-400 text-xs text-center">
                 ⚠ {socketError}
@@ -1009,7 +974,6 @@ export default function ClientGame({
               </div>
             )}
 
-            {/* Game info */}
             <div className="rounded-2xl border border-white/8 bg-[#1a1d2e] p-4">
               <p className="text-[10px] font-bold uppercase tracking-widest text-white/25 mb-3">Game</p>
               <div className="space-y-2.5">
@@ -1028,36 +992,25 @@ export default function ClientGame({
               </div>
             </div>
 
-            {/* ── Draw offer controls — active game only ──────────────── */}
             {status === "active" && !gameResult && (
               <div className="rounded-2xl border border-white/8 bg-[#1a1d2e] p-4 flex flex-col gap-2">
-
-                {/* No offer pending — show offer button if not on cooldown */}
                 {drawOfferedBy === 0 && (
-                  <button
-                    onClick={handleDrawOffer}
-                    disabled={drawSubmitting || !canOfferDraw}
+                  <button onClick={handleDrawOffer} disabled={drawSubmitting || !canOfferDraw}
                     title={drawCooldownRemaining > 0 ? `${drawCooldownRemaining} move${drawCooldownRemaining !== 1 ? "s" : ""} until you can offer again` : "Offer a draw"}
-                    className="w-full py-2.5 rounded-xl border border-white/8 text-white/40 hover:text-white/65 hover:border-white/18 hover:bg-white/[0.04] font-display font-600 text-sm transition-all duration-150 disabled:opacity-30 disabled:cursor-not-allowed"
-                  >
+                    className="w-full py-2.5 rounded-xl border border-white/8 text-white/40 hover:text-white/65 hover:border-white/18 hover:bg-white/[0.04] font-display font-600 text-sm transition-all duration-150 disabled:opacity-30 disabled:cursor-not-allowed">
                     {drawCooldownRemaining > 0
                       ? `Draw (${drawCooldownRemaining} move${drawCooldownRemaining !== 1 ? "s" : ""})`
                       : "Offer draw"}
                   </button>
                 )}
-
-                {/* I offered — show withdraw */}
                 {iHaveOfferedDraw && (
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-2 px-1">
                       <div className="w-1.5 h-1.5 rounded-full bg-white/30 draw-pulse flex-shrink-0" />
                       <span className="text-[11px] text-white/35">Draw offer sent</span>
                     </div>
-                    <button
-                      onClick={handleDrawCancel}
-                      disabled={drawSubmitting}
-                      className="w-full py-2 rounded-xl border border-white/8 text-white/30 hover:text-white/50 hover:border-white/14 font-display font-600 text-xs transition-all disabled:opacity-30"
-                    >
+                    <button onClick={handleDrawCancel} disabled={drawSubmitting}
+                      className="w-full py-2 rounded-xl border border-white/8 text-white/30 hover:text-white/50 hover:border-white/14 font-display font-600 text-xs transition-all disabled:opacity-30">
                       Withdraw
                     </button>
                   </div>
@@ -1065,7 +1018,6 @@ export default function ClientGame({
               </div>
             )}
 
-            {/* Resign */}
             {status === "active" && !gameResult && (
               <button onClick={handleResign}
                 className="w-full py-3 rounded-xl border border-red-500/20 text-red-400/70 hover:border-red-500/40 hover:bg-red-500/8 hover:text-red-400 font-display font-600 text-sm transition-all duration-150">

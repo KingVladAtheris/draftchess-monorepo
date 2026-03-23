@@ -1,11 +1,17 @@
 // apps/matchmaker/src/workers/timeout.ts
 //
-// CHANGE: Added reschedule count cap (MAX_RESCHEDULES = 4) stored in the
-// job data. If a timeout job has been rescheduled more than 4 times without
-// a move being made, the reconcile worker is the appropriate handler and we
-// let the job expire rather than looping indefinitely.
-// 4 reschedules × ~30s each = ~2 minutes of active spinning before giving up,
-// well within the reconcile worker's 5-minute cycle.
+// CHANGE: Raised MAX_RESCHEDULES from 4 to 10.
+//
+// Previous value (4) × ~30s = ~2 min before the worker gave up.
+// The reconcile worker runs every 5 min, leaving a ~3 min window where a
+// stuck game has no active handler. Raising to 10 covers up to ~5 min of
+// active spinning, meaning the reconcile worker will take over at worst
+// seconds after the cap is hit rather than several minutes after.
+//
+// 10 reschedules × ~30s = ~5 minutes of coverage before deferring.
+//
+// A surviving stale job is still harmless — the Lua FINISH_SCRIPT is
+// idempotent and finalizeGame's updateMany guard returns 0 if already done.
 
 import { Worker }            from 'bullmq'
 import { loadGameState }     from '@draftchess/game-state'
@@ -18,7 +24,10 @@ import type { RedisClientType } from 'redis'
 
 const log = logger.child({ module: 'matchmaker:timeout-worker' })
 
-const MAX_RESCHEDULES = 4
+// Covers ~5 minutes of active spinning — aligns with the reconcile interval
+// so there is no window where a game has neither an active timeout job nor
+// an imminent reconcile pass.
+const MAX_RESCHEDULES = 10
 
 export function createTimeoutWorker(publisher: RedisClientType) {
   const worker = new Worker(
@@ -35,12 +44,10 @@ export function createTimeoutWorker(publisher: RedisClientType) {
       }
 
       const state = await loadGameState(publisher, gameId)
-
       if (!state || state === 'finished') {
         log.debug({ gameId }, 'game not active or finished — skipping timeout')
         return
       }
-
       if (state.status !== 'active') {
         log.debug({ gameId, status: state.status }, 'game not active — skipping timeout')
         return
@@ -57,17 +64,14 @@ export function createTimeoutWorker(publisher: RedisClientType) {
 
       const now     = Date.now()
       const elapsed = now - state.lastMoveAt
-      const fenTurn = state.fen.split(' ')[1] ?? 'w'
 
+      const fenTurn   = state.fen.split(' ')[1] ?? 'w'
       const whiteIsP1 = state.whitePlayerId === state.player1Id
       const isP1Turn  = fenTurn === 'w' ? whiteIsP1 : !whiteIsP1
-
       const timebank  = isP1Turn ? state.player1Timebank : state.player2Timebank
       const remaining = timebank - Math.max(0, elapsed - 30_000)
 
       if (remaining > 0) {
-        // Cap reschedules to avoid infinite looping on a stuck game.
-        // After MAX_RESCHEDULES the reconcile worker takes over.
         if (rescheduleCount >= MAX_RESCHEDULES) {
           log.warn(
             { gameId, rescheduleCount, remaining },
@@ -81,6 +85,7 @@ export function createTimeoutWorker(publisher: RedisClientType) {
           { gameId, scheduledAt, rescheduleCount: rescheduleCount + 1 },
           { delay: remaining, jobId: `timeout-${gameId}` },
         )
+
         log.debug({ gameId, remaining, rescheduleCount: rescheduleCount + 1 }, 'time remaining — rescheduled')
         return
       }

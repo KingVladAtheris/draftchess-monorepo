@@ -4,11 +4,15 @@
 // Reads from Redis (fast path) with Postgres fallback via loadGameState.
 // For finished games (not in Redis), reads from Postgres directly.
 // Applies FEN masking during prep so neither player sees the other's aux pieces.
+//
+// CHANGE: For finished games, returns rematchOfferedBy / rematchSourceGameId
+// so ClientGame can seed rematchSourceGameId on page load — fixing the stale
+// source ID bug after a browser refresh.
 
 import { NextRequest, NextResponse }   from "next/server";
 import { auth }                        from "@/auth";
 import { prisma }                      from "@draftchess/db";
-import { loadGameState }               from "@draftchess/game-state";
+import { loadGameState, getGameState } from "@draftchess/game-state";
 import {
   buildCombinedDraftFen,
   maskOpponentAuxPlacements,
@@ -30,8 +34,15 @@ export async function GET(
   }
 
   const { id }  = await params;
-  const userId  = parseInt(session.user.id);
-  const gameId  = parseInt(id);
+  const userId  = parseInt(session.user.id, 10);
+  const gameId  = parseInt(id, 10);
+
+  if (isNaN(userId) || userId <= 0) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  if (isNaN(gameId) || gameId <= 0) {
+    return NextResponse.json({ error: "Invalid game ID" }, { status: 400 });
+  }
 
   const redis = await getRedisClient();
 
@@ -39,9 +50,8 @@ export async function GET(
   const state = await loadGameState(redis, gameId);
 
   // ── Finished game — read from Postgres ──────────────────────────────────
-  // Finished games are not cached in Redis. Read the final state directly.
   if (state === "finished") {
-    return getFinishedGameStatus(gameId, userId);
+    return getFinishedGameStatus(redis, gameId, userId);
   }
 
   // ── Game not found ──────────────────────────────────────────────────────
@@ -72,7 +82,6 @@ export async function GET(
   if (state.status === "active" && state.lastMoveAt > 0) {
     const fenTurn = fen.split(" ")[1];
     isMyTurn = (fenTurn === "w" && isWhite) || (fenTurn === "b" && !isWhite);
-
     const elapsed = Date.now() - state.lastMoveAt;
     if (isMyTurn) {
       timeRemainingOnMove = Math.max(0, MOVE_TIME_LIMIT - elapsed);
@@ -108,11 +117,17 @@ export async function GET(
     player1EloAfter: null,
     player2EloAfter: null,
     eloChange:       null,
+    // Rematch state — only relevant after the game ends, but returned here
+    // for symmetry with the finished path. Active games always have 0.
+    rematchOfferedBy:   state.rematchRequestedBy ?? 0,
+    rematchOfferedAt:   state.rematchOfferedAt   ?? 0,
+    rematchSourceGameId: state.rematchRequestedBy ? gameId : null,
   });
 }
 
-// ── Finished game path — reads from Postgres ─────────────────────────────────
+// ── Finished game path — reads from Postgres + Redis rematch state ────────────
 async function getFinishedGameStatus(
+  redis: any,
   gameId: number,
   userId: number,
 ): Promise<NextResponse> {
@@ -140,13 +155,29 @@ async function getFinishedGameStatus(
   if (!game) {
     return NextResponse.json({ error: "Game not found" }, { status: 404 });
   }
-
   if (game.player1Id !== userId && game.player2Id !== userId) {
     return NextResponse.json({ error: "You are not a participant in this game" }, { status: 403 });
   }
 
-  const isWhite   = game.whitePlayerId === userId;
-  const isPlayer1 = game.player1Id === userId;
+  const isWhite = game.whitePlayerId === userId;
+
+  // ── Read rematch state from Redis if the hash still exists ───────────────
+  // The hash lives for 4 hours after the game ends. If it's expired, we
+  // return zeroes — the accept route's slow-path scan covers that case.
+  let rematchOfferedBy   = 0;
+  let rematchOfferedAt   = 0;
+  let rematchSourceGameId: number | null = null;
+
+  try {
+    const redisState = await getGameState(redis, gameId);
+    if (redisState && redisState.rematchRequestedBy !== 0) {
+      rematchOfferedBy    = redisState.rematchRequestedBy;
+      rematchOfferedAt    = redisState.rematchOfferedAt;
+      rematchSourceGameId = gameId;
+    }
+  } catch {
+    // Non-fatal — rematch state is best-effort for the status API
+  }
 
   return NextResponse.json({
     fen:           game.fen ?? "",
@@ -172,5 +203,8 @@ async function getFinishedGameStatus(
     player1EloAfter: game.player1EloAfter ?? null,
     player2EloAfter: game.player2EloAfter ?? null,
     eloChange:       game.eloChange ?? null,
+    rematchOfferedBy,
+    rematchOfferedAt,
+    rematchSourceGameId,
   });
 }

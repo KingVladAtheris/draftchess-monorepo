@@ -24,7 +24,10 @@ import { logger }                      from "@draftchess/logger";
 
 const log = logger.child({ module: "web:place-route" });
 
-const PIECE_VALUES: Record<string, number> = { P: 1, N: 3, B: 3, R: 5 };
+const PIECE_VALUES: Record<string, number> = { P: 1, N: 3, B: 3, R: 5, Q: 9 };
+const VALID_PIECES = new Set(Object.keys(PIECE_VALUES));
+// Square format: file a-h, rank 1-8
+const SQUARE_RE = /^[a-h][1-8]$/;
 
 export async function POST(
   req: NextRequest,
@@ -39,37 +42,57 @@ export async function POST(
   }
 
   const { id }  = await params;
-  const userId  = parseInt(session.user.id);
-  const gameId  = parseInt(id);
+  const userId  = parseInt(session.user.id, 10);
+  const gameId  = parseInt(id, 10);
+
+  if (isNaN(userId) || userId <= 0) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  if (isNaN(gameId) || gameId <= 0) {
+    return NextResponse.json({ error: "Invalid game ID" }, { status: 400 });
+  }
 
   const limited = await consume(placeLimiter, req, userId.toString());
   if (limited) return limited;
 
-  let body: any;
+  let body: unknown;
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { piece, square } = body;
-  if (!piece || !square) {
-    return NextResponse.json({ error: "piece and square required" }, { status: 400 });
+  if (typeof body !== "object" || body === null) {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  const { piece, square } = body as Record<string, unknown>;
+
+  if (typeof piece !== "string") {
+    return NextResponse.json({ error: "piece must be a string" }, { status: 400 });
+  }
+  if (typeof square !== "string") {
+    return NextResponse.json({ error: "square must be a string" }, { status: 400 });
+  }
+
+  const pieceUpper = piece.toUpperCase();
+  if (!VALID_PIECES.has(pieceUpper)) {
+    return NextResponse.json({ error: "Invalid piece type" }, { status: 400 });
+  }
+  if (!SQUARE_RE.test(square)) {
+    return NextResponse.json({ error: "Invalid square" }, { status: 400 });
   }
 
   const redis = await getRedisClient();
 
   // ── Load game state from Redis ──────────────────────────────────────────
   const state = await loadGameState(redis, gameId);
-
   if (!state || state === "finished") {
     return NextResponse.json({ error: "Invalid game state" }, { status: 400 });
   }
-
   if (state.status !== "prep") {
     return NextResponse.json({ error: "Invalid game state" }, { status: 400 });
   }
-
   if (state.player1Id !== userId && state.player2Id !== userId) {
     return NextResponse.json({ error: "Not participant" }, { status: 403 });
   }
@@ -77,37 +100,24 @@ export async function POST(
   const isWhite   = state.whitePlayerId === userId;
   const isPlayer1 = state.player1Id === userId;
 
-  // ── Validate piece type ─────────────────────────────────────────────────
-  const value = PIECE_VALUES[piece.toUpperCase()];
-  if (!value) {
-    return NextResponse.json({ error: "Invalid piece type" }, { status: 400 });
-  }
-
-  // ── Validate square ─────────────────────────────────────────────────────
+  // ── Validate square rank ────────────────────────────────────────────────
   const rank      = parseInt(square[1], 10);
-  const fileIndex = square.charCodeAt(0) - "a".charCodeAt(0);
+  const ownRanks  = isWhite ? [1, 2] : [7, 8];
 
-  if (isNaN(rank) || isNaN(fileIndex) || fileIndex < 0 || fileIndex > 7) {
-    return NextResponse.json({ error: "Invalid square" }, { status: 400 });
-  }
-
-  const ownRanks = isWhite ? [1, 2] : [7, 8];
   if (!ownRanks.includes(rank)) {
     return NextResponse.json({ error: "Can only place on own ranks" }, { status: 400 });
   }
-
-  if (piece.toUpperCase() === "P" && rank !== (isWhite ? 2 : 7)) {
+  if (pieceUpper === "P" && rank !== (isWhite ? 2 : 7)) {
     return NextResponse.json({ error: "Pawns can only be placed on the front rank" }, { status: 400 });
   }
 
   const currentFen = state.fen;
-
   if (getPieceAt(currentFen, square) !== "1") {
     return NextResponse.json({ error: "Square is already occupied" }, { status: 400 });
   }
 
   // ── Build new FEN and validate battery rule ─────────────────────────────
-  const pieceChar = isWhite ? piece.toUpperCase() : piece.toLowerCase();
+  const pieceChar = isWhite ? pieceUpper : pieceUpper.toLowerCase();
   const newFen    = placePieceOnFen(currentFen, pieceChar, square);
 
   if (hasIllegalBattery(newFen, isWhite)) {
@@ -115,10 +125,8 @@ export async function POST(
   }
 
   // ── Atomic place via Lua script ─────────────────────────────────────────
-  // The Lua script atomically checks aux points, decrements them, and
-  // updates the FEN. Prevents race conditions between concurrent requests.
+  const value       = PIECE_VALUES[pieceUpper]!;
   const pointsField = isPlayer1 ? "auxPointsPlayer1" : "auxPointsPlayer2";
-
   const result = await placePiece(redis, gameId, pointsField, value, newFen);
 
   if (!result.ok) {
@@ -132,7 +140,6 @@ export async function POST(
   }
 
   // ── Broadcast raw FEN ───────────────────────────────────────────────────
-  // The socket server subscriber applies maskOpponentAuxPlacements per player.
   const newAuxPoints = result.newAuxPoints;
   await publishGameUpdate(gameId, {
     fen: newFen,
@@ -141,6 +148,8 @@ export async function POST(
       : { auxPointsPlayer2: newAuxPoints }
     ),
   });
+
+  log.debug({ gameId, userId, piece: pieceUpper, square }, "piece placed");
 
   return NextResponse.json({ success: true });
 }

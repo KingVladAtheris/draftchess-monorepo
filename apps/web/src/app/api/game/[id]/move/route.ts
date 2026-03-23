@@ -6,7 +6,6 @@
 // Writes a Move row to Postgres for PGN/replay on every move.
 // If a terminal position is detected, publishes to draftchess:game-ended
 // and lets the matchmaker handle ELO, stats, and Postgres finalization.
-// Never calls updateGameResult — that code is deleted.
 
 import { NextRequest, NextResponse } from "next/server";
 import { auth }                      from "@/auth";
@@ -29,6 +28,10 @@ const log = logger.child({ module: "web:move-route" });
 const MOVE_TIME_LIMIT         = 30_000;
 const TIMEBANK_BONUS_INTERVAL = 20;
 const TIMEBANK_BONUS_AMOUNT   = 60_000;
+
+const VALID_PROMOTIONS = new Set(["q", "r", "b", "n"]);
+// Square format: file a-h, rank 1-8
+const SQUARE_RE = /^[a-h][1-8]$/;
 
 class DraftChess extends Chess {
   move(moveObj: any, options?: any) {
@@ -58,41 +61,58 @@ export async function POST(
   }
 
   const { id }  = await params;
-  const userId  = parseInt(session.user.id);
-  const gameId  = parseInt(id);
+  const userId  = parseInt(session.user.id, 10);
+  const gameId  = parseInt(id, 10);
+
+  if (isNaN(userId) || userId <= 0) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+  if (isNaN(gameId) || gameId <= 0) {
+    return NextResponse.json({ error: "Invalid game ID" }, { status: 400 });
+  }
 
   const limited = await consume(moveLimiter, req, userId.toString());
   if (limited) return limited;
 
-  let body: any;
+  let body: unknown;
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
 
-  const { from, to, promotion } = body;
-  if (!from || !to) {
-    return NextResponse.json({ error: "from and to are required" }, { status: 400 });
+  if (typeof body !== "object" || body === null) {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
+  const { from, to, promotion } = body as Record<string, unknown>;
+
+  if (typeof from !== "string" || !SQUARE_RE.test(from)) {
+    return NextResponse.json({ error: "Invalid 'from' square" }, { status: 400 });
+  }
+  if (typeof to !== "string" || !SQUARE_RE.test(to)) {
+    return NextResponse.json({ error: "Invalid 'to' square" }, { status: 400 });
+  }
+
+  // promotion must be undefined/null or one of q/r/b/n
+  const promoStr = promotion == null ? "q" : String(promotion).toLowerCase();
+  if (!VALID_PROMOTIONS.has(promoStr)) {
+    return NextResponse.json({ error: "Invalid promotion piece" }, { status: 400 });
   }
 
   const redis = await getRedisClient();
 
   // ── Load game state from Redis (fast path) ──────────────────────────────
   const state = await loadGameState(redis, gameId);
-
   if (!state || state === "finished") {
     return NextResponse.json({ error: "Game is not active" }, { status: 400 });
   }
-
   if (state.status !== "active") {
     return NextResponse.json({ error: "Game is not active" }, { status: 400 });
   }
-
   if (state.player1Id !== userId && state.player2Id !== userId) {
     return NextResponse.json({ error: "You are not a participant in this game" }, { status: 403 });
   }
-
   if (!state.fen) {
     return NextResponse.json({ error: "Game has no position" }, { status: 400 });
   }
@@ -113,19 +133,14 @@ export async function POST(
   const elapsedMs    = now - lastMoveTime;
   const isPlayer1    = state.player1Id === userId;
 
-  // FIX: correctly map player slot to timebank using whitePlayerId
-  // (not assuming white === player1)
   const currentTimebank = isPlayer1 ? state.player1Timebank : state.player2Timebank;
   const overage         = Math.max(0, elapsedMs - MOVE_TIME_LIMIT);
 
   // ── Time expiry check ───────────────────────────────────────────────────
-  // If the player ran out of time, delegate finalization to the matchmaker.
   if (overage > 0 && currentTimebank - overage <= 0) {
     const winnerId = isPlayer1 ? state.player2Id : state.player1Id;
 
-    // Mark finished in Redis atomically
     const marked = await markGameFinished(redis, gameId);
-
     if (marked) {
       const payload: GameEndedPayload = {
         gameId,
@@ -153,7 +168,7 @@ export async function POST(
 
   // ── Validate and execute move ───────────────────────────────────────────
   try {
-    chess.move({ from, to, promotion: promotion ?? "q" });
+    chess.move({ from: from as Square, to: to as Square, promotion: promoStr });
   } catch (err: any) {
     return NextResponse.json({ error: `Illegal move: ${err.message}` }, { status: 400 });
   }
@@ -175,7 +190,6 @@ export async function POST(
 
   // ── Timebank accounting ─────────────────────────────────────────────────
   const bonusAwarded = newMoveNumber % TIMEBANK_BONUS_INTERVAL === 0;
-
   let newP1Timebank = state.player1Timebank;
   let newP2Timebank = state.player2Timebank;
 
@@ -208,14 +222,10 @@ export async function POST(
   );
 
   if (!moveResult.ok) {
-    // Game was already finished by another path (timeout worker, forfeit)
     return NextResponse.json({ error: "Game already finished" }, { status: 409 });
   }
 
   // ── Write Move row to Postgres for PGN/replay ───────────────────────────
-  // Non-blocking — we don't await this on the critical path.
-  // If it fails, the reconcile worker or a background job can rebuild from
-  // the game's final state. The move is already committed to Redis.
   const lastMove = chess.history({ verbose: true }).at(-1);
   prisma.move.create({
     data: {
@@ -223,7 +233,7 @@ export async function POST(
       moveNumber: newMoveNumber,
       from:       from as string,
       to:         to as string,
-      promotion:  promotion ?? null,
+      promotion:  promoStr !== "q" || (lastMove?.flags ?? "").includes("p") ? promoStr : null,
       san:        lastMove?.san ?? `${from}${to}`,
       fen:        newFen,
     },
@@ -232,11 +242,7 @@ export async function POST(
   // ── Terminal position — delegate to matchmaker ──────────────────────────
   if (isTerminal && endReason !== null) {
     const marked = await markGameFinished(redis, gameId);
-
     if (marked) {
-      // Re-read state to get the latest timebanks we just wrote
-      const finalState = await getGameState(redis, gameId);
-
       const payload: GameEndedPayload = {
         gameId,
         winnerId,
@@ -258,7 +264,6 @@ export async function POST(
 
   // ── Broadcast move to all players ───────────────────────────────────────
   const newTurn = new DraftChess(newFen).turn();
-
   const broadcastPayload: Record<string, any> = {
     fen:             newFen,
     moveNumber:      newMoveNumber,
@@ -273,11 +278,11 @@ export async function POST(
     broadcastPayload.status    = "finished";
     broadcastPayload.winnerId  = winnerId;
     broadcastPayload.endReason = endReason;
-    // ELO values will follow in a separate game-update event
-    // published by the matchmaker after finalization
   }
 
   await publishGameUpdate(gameId, broadcastPayload);
+
+  log.debug({ gameId, userId, moveNumber: newMoveNumber, from, to }, "move applied");
 
   return NextResponse.json({
     success:         true,
