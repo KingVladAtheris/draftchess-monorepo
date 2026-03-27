@@ -3,8 +3,6 @@
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
-  // directUrl bypasses PgBouncer for migrations (prisma migrate, prisma db push).
-  // The app never uses this — it always goes through DATABASE_URL.
   directUrl = env("DATABASE_DIRECT_URL")
 }
 
@@ -32,6 +30,19 @@ enum TournamentStatus {
   active
   finished
   cancelled
+}
+
+// ─── Admin ─────────────────────────────────────────────────────────────────────
+// Completely separate from the player User table.
+// Admins are created manually via seed script — no signup flow.
+
+model AdminUser {
+  id           Int      @id @default(autoincrement())
+  username     String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+
+  @@index([username])
 }
 
 // ─── User ──────────────────────────────────────────────────────────────────────
@@ -151,24 +162,19 @@ model Game {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  // Position — final FEN written on game end, not updated during play
-  // (active game FEN lives in Redis)
   fen           String?
   prepStartedAt DateTime?
   readyPlayer1  Boolean  @default(false)
   readyPlayer2  Boolean  @default(false)
-
   auxPointsPlayer1 Int @default(6)
   auxPointsPlayer2 Int @default(6)
 
-  // Time control — final values written on game end
   lastMoveAt      DateTime?
   lastMoveBy      Int?
   moveNumber      Int       @default(0)
   player1Timebank Int       @default(60000)
   player2Timebank Int       @default(60000)
 
-  // Result & ELO
   winnerId         Int?
   player1EloBefore Int?
   player2EloBefore Int?
@@ -178,23 +184,21 @@ model Game {
   endReason        String?
   isFriendGame     Boolean @default(false)
 
-  // PGN — built from Move table on game end and stored for fast replay access
   pgn String? @db.Text
 
-  // Rematch
   rematchRequestedBy Int?
 
-  // Tournament context
   tournamentId    Int?
-  tournamentRound Int?
+  tournamentRoundId Int?
 
-  // Relations
   player1    User        @relation("Player1",     fields: [player1Id],     references: [id], onDelete: Cascade)
   player2    User        @relation("Player2",     fields: [player2Id],     references: [id], onDelete: Cascade)
   whitePlayer User       @relation("WhitePlayer", fields: [whitePlayerId], references: [id], onDelete: Cascade)
   draft1     Draft?      @relation("GameDraft1",  fields: [draft1Id],      references: [id], onDelete: SetNull)
   draft2     Draft?      @relation("GameDraft2",  fields: [draft2Id],      references: [id], onDelete: SetNull)
-  tournament Tournament? @relation(fields: [tournamentId], references: [id], onDelete: SetNull)
+  tournament      Tournament?      @relation(fields: [tournamentId],      references: [id], onDelete: SetNull)
+  tournamentRound TournamentRound? @relation("GameTournamentRound", fields: [tournamentRoundId], references: [id], onDelete: SetNull)
+  tournamentGame  TournamentGame?
   moves      Move[]
 
   @@index([player1Id])
@@ -208,24 +212,23 @@ model Game {
   @@index([winnerId])
   @@index([lastMoveAt])
   @@index([tournamentId])
+  @@index([tournamentRoundId])
   @@index([status, lastMoveAt])
   @@index([player1Id, mode, createdAt])
   @@index([player2Id, mode, createdAt])
 }
 
 // ─── Move ──────────────────────────────────────────────────────────────────────
-// One row per move. Used to build PGN for the replayer and for game history.
-// Written by the move route on every move.
 
 model Move {
   id         Int    @id @default(autoincrement())
   gameId     Int
   moveNumber Int
-  from       String // e.g. "e2"
-  to         String // e.g. "e4"
-  promotion  String? // "q" | "r" | "b" | "n" | null
-  san        String  // Standard Algebraic Notation e.g. "e4", "Nf3", "O-O"
-  fen        String  // FEN after this move — needed for replayer seek
+  from       String
+  to         String
+  promotion  String?
+  san        String
+  fen        String
   createdAt  DateTime @default(now())
 
   game Game @relation(fields: [gameId], references: [id], onDelete: Cascade)
@@ -241,20 +244,31 @@ model TokenDefinition {
   slug        String  @unique
   label       String
   description String?
-  icon        String?
-  color       String?
+  icon        String? // emoji or short symbol e.g. "👑", "★"
+  color       String? // hex color for badge tint e.g. "#f59e0b"
   adminOnly   Boolean @default(true)
+  durationDays Int?   // null = permanent, N = expires after N days
 
   // Whether holding this token grants specific app privileges.
-  // Checked via user-entitlements:{userId} Redis set at runtime.
   grantsPrivilege Boolean @default(false)
 
+  // Purchasable tokens (wired to Stripe at step 4)
+  isPurchasable Boolean @default(false)
+  stripePriceId String? @unique // Stripe Price ID e.g. "price_xxx"
+
+  // Whether this token is consumed when used for tournament entry.
+  // false = checked for presence only (e.g. premium token)
+  // true  = deducted on entry (e.g. qualifier token)
+  consumeOnEntry Boolean @default(false)
+
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   holders UserToken[]
 
   @@index([slug])
   @@index([grantsPrivilege])
+  @@index([isPurchasable])
 }
 
 model UserToken {
@@ -262,17 +276,15 @@ model UserToken {
   userId    Int
   tokenId   Int
   grantedAt DateTime @default(now())
-  grantedBy Int?     // userId of admin who granted, null if auto-granted or purchased
+  grantedBy Int?     // adminUser.id of admin who granted, null if auto-granted or purchased
 
   // Expiry — null means permanent (achievement tokens, lifetime purchases)
   expiresAt DateTime?
 
   // Status: active | expired | revoked
-  // expired: set by nightly cleanup job
-  // revoked: set by admin action or ban
   status String @default("active")
 
-  // Payment tracking (null for achievement tokens)
+  // Payment tracking (null for non-purchased tokens)
   stripePaymentIntentId String?
 
   note String?
@@ -290,8 +302,6 @@ model UserToken {
 
 // ─── Stripe ────────────────────────────────────────────────────────────────────
 
-// Idempotency table — Stripe can deliver webhooks more than once.
-// Store the event ID and check before processing to prevent double-grants.
 model StripeWebhookEvent {
   id        String   @id // Stripe event ID (evt_...)
   type      String
@@ -307,11 +317,6 @@ model Notification {
   id        Int      @id @default(autoincrement())
   userId    Int
   type      String
-  // type values:
-  //   friend_request | challenge | draw_offer | rematch_offer
-  //   token_granted | token_expiring | token_expired
-  //   tournament_starting | tournament_cancelled
-  //   game_ended (for async result delivery)
   payload   Json
   read      Boolean  @default(false)
   createdAt DateTime @default(now())
@@ -336,14 +341,16 @@ model Tournament {
   finishedAt         DateTime?
   createdAt          DateTime         @default(now())
   updatedAt          DateTime         @updatedAt
+
   maxPlayers         Int?
   minPlayers         Int              @default(2)
   prizeDescription   String?
   winnerId           Int?
 
-  // Token slug required to enter. Null means open to all.
-  // e.g. "tournament-entry" for a paid entry token
   requiredTokenSlug String?
+
+  stages TournamentStage[]
+  prizes TournamentPrize[]
 
   players TournamentPlayer[]
   games   Game[]
@@ -361,6 +368,7 @@ model TournamentPlayer {
   registeredAt DateTime @default(now())
   score        Float    @default(0)
   rank         Int?
+  buchholz     Float    @default(0)
   eliminated   Boolean  @default(false)
 
   tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
@@ -370,6 +378,114 @@ model TournamentPlayer {
   @@index([tournamentId])
   @@index([userId])
   @@index([tournamentId, score])
+}
+
+model TournamentStage {
+  id           Int      @id @default(autoincrement())
+  tournamentId Int
+  stageNumber  Int
+  name         String?
+
+  format TournamentFormat
+
+  // null on the final stage — runs until a full hierarchy is determined
+  advanceCount Int?
+
+  // "fixed"    → fixedStartAt is used
+  // "relative" → starts relativeBreakMinutes after previous stage ends
+  startTimeType        String    @default("fixed")
+  fixedStartAt         DateTime?
+  relativeBreakMinutes Int?
+
+  // For swiss: explicit round count. null = ceil(log2(playerCount))
+  totalRounds  Int?
+  currentRound Int      @default(0)
+
+  // "pending" | "active" | "paused" | "finished"
+  status     String    @default("pending")
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  tournament  Tournament                 @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+  rounds      TournamentRound[]
+  placements  TournamentStagePlacement[]
+
+  @@unique([tournamentId, stageNumber])
+  @@index([tournamentId])
+  @@index([status])
+}
+
+model TournamentRound {
+  id          Int      @id @default(autoincrement())
+  stageId     Int
+  roundNumber Int
+
+  draftPickDeadline DateTime?
+
+  // "awaiting_drafts" | "active" | "finished"
+  status     String    @default("awaiting_drafts")
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  stage     TournamentStage  @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  games     TournamentGame[]
+  liveGames Game[]           @relation("GameTournamentRound")
+
+  @@unique([stageId, roundNumber])
+  @@index([stageId])
+  @@index([status])
+}
+
+model TournamentGame {
+  id      Int  @id @default(autoincrement())
+  roundId Int
+  gameId  Int? @unique
+
+  player1Id Int
+  player2Id Int
+
+  // Populated during the 3-minute pick window or auto-assigned at deadline
+  player1DraftId Int?
+  player2DraftId Int?
+
+  isBye    Boolean @default(false)
+  winnerId Int?
+  isDraw   Boolean @default(false)
+
+  round TournamentRound @relation(fields: [roundId], references: [id], onDelete: Cascade)
+  game  Game?           @relation(fields: [gameId],  references: [id], onDelete: SetNull)
+
+  @@index([roundId])
+  @@index([gameId])
+  @@index([player1Id])
+  @@index([player2Id])
+}
+
+model TournamentStagePlacement {
+  id        Int     @id @default(autoincrement())
+  stageId   Int
+  userId    Int
+  rank      Int
+  rankLabel String? // null for top-4 individual, "5–8" etc. beyond that
+
+  stage TournamentStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+
+  @@unique([stageId, userId])
+  @@index([stageId])
+}
+
+model TournamentPrize {
+  id           Int     @id @default(autoincrement())
+  tournamentId Int
+  rankFrom     Int
+  rankTo       Int
+  prizeType    String  @default("token") // "token" | "other"
+  tokenSlug    String?
+  description  String?
+
+  tournament Tournament @relation(fields: [tournamentId], references: [id], onDelete: Cascade)
+
+  @@index([tournamentId])
 }
 
 // ─── Friends / Follow ──────────────────────────────────────────────────────────
@@ -467,3 +583,4 @@ model VerificationToken {
 
   @@unique([identifier, token])
 }
+

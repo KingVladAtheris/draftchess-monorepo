@@ -33,6 +33,9 @@ import { cancelTimeoutJob }  from '../queues.js'
 import { logger }            from '@draftchess/logger'
 import type { GameMode }     from '@draftchess/shared/game-modes'
 import type { RedisClientType } from 'redis'
+import { recordTournamentGameResult } from '@draftchess/tournament-engine'
+import { tournamentQueue }            from '../workers/tournament.js'
+import { prisma } from '@draftchess/db'
 
 const log = logger.child({ module: 'matchmaker:game-ended-subscriber' })
 
@@ -128,6 +131,41 @@ export async function startGameEndedSubscriber(
     } catch (err: any) {
       log.error({ gameId, err: err.message }, 'error processing game-ended event')
     }
+
+    const DRAW_END_REASONS = new Set([
+      'draw',
+      'stalemate',
+      'repetition',
+      'draw_agreement',
+      'insufficient_material',
+    ])
+
+    try {
+      const tGame = await prisma.tournamentGame.findFirst({
+        where:   { gameId: payload.gameId },
+        select:  { id: true, roundId: true },
+      })
+
+      if (tGame) {
+        const isDraw = DRAW_END_REASONS.has(payload.endReason ?? '')
+
+        await recordTournamentGameResult({
+          tournamentGameId: tGame.id,
+          winnerId:         isDraw ? null : (payload.winnerId ?? null),
+          isDraw,
+        })
+
+        await tournamentQueue.add('tournament', {
+          type:    'round-check',
+          roundId: tGame.roundId,
+        })
+      }
+    } catch (err: any) {
+      // Non-fatal — log and continue. The round-check can be manually triggered
+      // from the admin panel if needed.
+      log.error({ gameId: payload.gameId, err: err.message }, 'tournament result mirror failed')
+    }
+
   })
 
   log.info('subscribed to draftchess:game-ended')

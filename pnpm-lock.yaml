@@ -29,6 +29,12 @@ importers:
       '@draftchess/shared':
         specifier: workspace:*
         version: link:../../packages/shared
+      '@draftchess/token-service':
+        specifier: workspace:*
+        version: link:../../packages/token-service
+      '@draftchess/tournament-engine':
+        specifier: workspace:*
+        version: link:../../packages/tournament-engine
       bullmq:
         specifier: ^5.0.0
         version: 5.71.0
@@ -124,6 +130,9 @@ importers:
       ioredis:
         specifier: ^5.0.0
         version: 5.9.3
+      jose:
+        specifier: ^6.0.0
+        version: 6.2.1
       next:
         specifier: ^16.1.0
         version: 16.1.6(@babel/core@7.29.0)(react-dom@19.2.4(react@19.2.4))(react@19.2.4)
@@ -244,6 +253,38 @@ importers:
         version: 5.9.3
 
   packages/socket-types:
+    devDependencies:
+      typescript:
+        specifier: ^5.4.0
+        version: 5.9.3
+
+  packages/token-service:
+    dependencies:
+      '@draftchess/db':
+        specifier: workspace:*
+        version: link:../db
+      '@draftchess/logger':
+        specifier: workspace:*
+        version: link:../logger
+    devDependencies:
+      typescript:
+        specifier: ^5.4.0
+        version: 5.9.3
+
+  packages/tournament-engine:
+    dependencies:
+      '@draftchess/db':
+        specifier: workspace:*
+        version: link:../db
+      '@draftchess/logger':
+        specifier: workspace:*
+        version: link:../logger
+      '@draftchess/token-service':
+        specifier: workspace:*
+        version: link:../token-service
+      bullmq:
+        specifier: ^5.0.0
+        version: 5.71.0
     devDependencies:
       typescript:
         specifier: ^5.4.0

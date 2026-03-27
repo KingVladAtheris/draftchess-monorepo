@@ -28,6 +28,8 @@ import {
   reconcileQueue,
   scheduleTimeout,
 } from './queues.js'
+import { createTournamentWorker } from './workers/tournament.js'
+import { tokenCleanupQueue, tokenCleanupWorker } from './workers/token-cleanup.js'
 
 const log = logger.child({ module: 'matchmaker' })
 
@@ -49,6 +51,7 @@ const matchWorker     = createMatchWorker(publisher)
 const prepWorker      = createPrepWorker(publisher)
 const timeoutWorker   = createTimeoutWorker(publisher)
 const reconcileWorker = createReconcileWorker(publisher)
+const tournamentWorker = createTournamentWorker(publisher)
 
 // ── Health server ──────────────────────────────────────────────────────────────
 let isHealthy = false
@@ -214,12 +217,11 @@ async function main(): Promise<void> {
   // Expires tokens past their expiresAt, sends reminder notifications
   // for tokens expiring within 3 days, publishes entitlement revocations.
   // Runs at midnight UTC — tunable via TOKEN_CLEANUP_CRON env var.
-  const { tokenCleanupQueue } = await import('./queues.js').then(async (q) => {
-    // We'll add this queue when we build the token cleanup worker
-    // For now just log that it will be scheduled
-    return { tokenCleanupQueue: null }
+  await tokenCleanupQueue.add('cleanup', {}, {
+    jobId:  'token-cleanup-singleton',
+    repeat: { pattern: '0 0 * * *' },
   })
-  log.info('token cleanup job will be scheduled when worker is built')
+  log.info('token cleanup job scheduled (nightly midnight UTC)')
 
   healthServer.listen(HEALTH_PORT, () => {
     log.info({ port: HEALTH_PORT }, 'health endpoint listening')
@@ -239,6 +241,8 @@ async function shutdown(signal: string): Promise<void> {
     prepWorker.close(),
     timeoutWorker.close(),
     reconcileWorker.close(),
+    tournamentWorker.close(),
+    tokenCleanupWorker.close(),
   ])
 
   await Promise.all([

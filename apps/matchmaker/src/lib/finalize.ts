@@ -43,6 +43,49 @@ export async function finalizeGame(
   redis:       RedisClientType,
 ): Promise<FinalizeResult | null> {
 
+  const gameRow = await prisma.game.findUnique({
+    where:  { id: gameId },
+    select: { tournamentId: true, player1EloBefore: true, player2EloBefore: true },
+  })
+
+  if (gameRow?.tournamentId) {
+    let finalized = false
+
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      // Idempotency guard — only finalize once
+      const guard = await tx.game.updateMany({
+        where: { id: gameId, status: 'active' },
+        data:  { status: 'finished', winnerId: winnerId ?? undefined, endReason },
+      })
+      if (guard.count === 0) return
+
+      const queueReset = {
+        queueStatus:   'offline',
+        queuedAt:      null,
+        queuedDraftId: null,
+        queuedMode:    null,
+      }
+      await tx.user.update({ where: { id: player1Id }, data: queueReset })
+      await tx.user.update({ where: { id: player2Id }, data: queueReset })
+
+      finalized = true
+    })
+
+    if (finalized) {
+      await deleteGameState(redis, gameId)
+    }
+
+    // Return a neutral result — caller (game-ended-subscriber) reads these
+    // values but they will not be written to the ELO columns
+    return finalized
+      ? {
+          newP1Elo:  gameRow.player1EloBefore ?? 1200,
+          newP2Elo:  gameRow.player2EloBefore ?? 1200,
+          eloChange: 0,
+        }
+      : null
+  }
+
   // ── Friend games ─────────────────────────────────────────────────────────────
   if (isFriendGame) {
     let finalized = false
