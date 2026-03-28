@@ -161,6 +161,14 @@ function NotificationsBell({ userId }: { userId: number }) {
     getSocket().then(socket => {
       socket.on("notification", (data: any) => {
         if (!mounted) return;
+        // Auto-redirect to pick page when tournament round starts
+        if (data.notificationType === 'tournament_pick_draft') {
+          const { tournamentId, roundId } = data.payload ?? {}
+          if (tournamentId && roundId) {
+            window.location.href = `/tournaments/${tournamentId}/${roundId}/pick`
+            return  // don't add to bell — they're being redirected
+          }
+        }
         const notif: AppNotification = {
           id:        data.notificationId ?? Date.now(),
           type:      data.notificationType ?? "unknown",
@@ -302,6 +310,19 @@ function NotificationsBell({ userId }: { userId: number }) {
           </div>
 
           <div className="flex-1 min-w-0">
+            {n.type === 'tournament_pick_draft' && (
+              <p className="text-sm text-white/80 leading-snug">
+                Round {n.payload?.roundNumber} has started.{' '}
+                <Link
+                  href={`/tournaments/${n.payload?.tournamentId}/${n.payload?.roundId}/pick`}
+                  className="font-semibold text-amber-400 hover:text-amber-300 transition-colors"
+                  onClick={() => setOpen(false)}
+                >
+                  Pick your draft →
+                </Link>
+              </p>
+            )}
+
             {n.type === "friend_request" && (
               <>
                 <p className="text-sm text-white/80 leading-snug">
@@ -707,9 +728,9 @@ export default function Nav() {
           <>
             <NavDropdown label="Play"   items={playItems}  />
             <NavDropdown label="Drafts" items={draftItems} />
-            <div className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-white/25 cursor-not-allowed select-none">
-              Tournaments <SoonPill />
-            </div>
+            <Link href="/tournaments" className="px-3 py-2 text-sm font-medium text-white/60 hover:text-white hover:bg-white/6 rounded-lg transition-colors duration-150">
+              Tournaments
+            </Link>
           </>
         )}
 

@@ -41,8 +41,8 @@ import type { RedisClientType }       from 'redis'
 
 const log = logger.child({ module: 'matchmaker:tournament' })
 
-// 3-minute pick window — after this, most-recently-updated draft is auto-assigned
-const DRAFT_PICK_WINDOW_MS = 3 * 60 * 1000
+// 1-minute pick window — after this, most-recently-updated draft is auto-assigned
+const DRAFT_PICK_WINDOW_MS = 1 * 60 * 1000
 
 export const tournamentQueue = new Queue('tournament-queue', {
   connection:        redisOpts,
